@@ -1,0 +1,639 @@
+---
+title: "Tenure relationship to rank Analysis"
+author: "Alba Motes Rodrigo"
+date: "2025-10-17"
+output: 
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  error = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+<style>
+h1 {
+  font-size: 32px;
+  font-weight: bold;
+}
+h2 {
+  font-size: 26px;
+  font-weight: bold;
+}
+h3 {
+  font-size: 22px;
+  font-weight: bold;
+}
+</style>
+
+# Load Packages and Data
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(ggeffects)
+library(EloRating)
+library(performance)
+library(emmeans)
+
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Analyses/dharma_diagnostic_fnct.R")
+
+emigrants<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/All_potential_immigrants.csv")
+
+# load life history IVP, conflict data and group_presence matrices
+load("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/Immigrants_environment.RData")
+```
+
+# Analysis: Does Tenure Predict Final Rank?
+
+## Prepare Data
+
+```{r}
+# Analysis 1: Does tenure predict final rank?
+library(lme4)
+library(lmerTest)
+library(dplyr)
+library(glmmTMB)
+
+# Filter emigrants with Elo rating based on all conflicts AND at least 5 conflicts
+emigrants_with_elo_all <- emigrants[!is.na(emigrants$elo_end_tenure_all) & 
+                                     emigrants$n_conflicts_end_tenure_all >= 5, ]
+#111
+
+# Filter emigrants with Elo rating based on male-male conflicts AND at least 5 male-male conflicts
+emigrants_with_elo_male_male <- emigrants[!is.na(emigrants$elo_end_tenure_male_male) & 
+                                           emigrants$n_conflicts_end_tenure_male_male >= 5, ]
+#104 males
+
+# Exclude tenures of 0
+emigrants_with_elo_all <- emigrants_with_elo_all %>% filter(Tenure > 0)
+emigrants_with_elo_male_male <- emigrants_with_elo_male_male %>% filter(Tenure > 0)
+
+#some individuals has elo of 0 or 1 which needs to be transformed
+# Transform Elo ratings for all conflicts dataset
+emigrants_with_elo_all <- emigrants_with_elo_all %>%
+  mutate(tr_elo_at_end_tenure_all = case_when(
+    elo_end_tenure_all == 0 ~ 0.0001,
+    elo_end_tenure_all == 1 ~ 0.9999,
+    TRUE ~ elo_end_tenure_all
+  ))
+
+# Transform Elo ratings for male-male conflicts dataset
+emigrants_with_elo_male_male <- emigrants_with_elo_male_male %>%
+  mutate(tr_elo_at_end_tenure_male_male = case_when(
+    elo_end_tenure_male_male == 0 ~ 0.0001,
+    elo_end_tenure_male_male == 1 ~ 0.9999,
+    TRUE ~ elo_end_tenure_male_male
+  ))
+```
+
+## Models: All Conflicts
+
+```{r}
+#all conflicts
+model15 <- glmmTMB(tr_elo_at_end_tenure_all ~ Tenure*ImmigrationGp1,
+                      data = emigrants_with_elo_all, family = beta_family())
+
+#interaction not significant but full-null model significant and important for model stability
+check_lmer_assumptions_dharma(model15)
+
+#if i drop the interaction (not-significant, bad model fit)
+model15_noint <- glmmTMB(tr_elo_at_end_tenure_all ~ Tenure+ImmigrationGp1,
+                      data = emigrants_with_elo_all, family = beta_family())
+check_lmer_assumptions_dharma(model15_noint)
+
+#so the interaction needs to be kept
+
+#The lack of fit might be due to the problematic groups
+#crossing and LT excluded (bad groups) and IF, which was rank-deficient
+emigrants_with_elo_all_sub <- subset(emigrants_with_elo_all, !ImmigrationGp1 %in% c("LT", "CR", "IF"))
+
+model15.sub <- glmmTMB(tr_elo_at_end_tenure_all ~ Tenure*ImmigrationGp1,
+                      data = emigrants_with_elo_all_sub, family = beta_family())
+check_lmer_assumptions_dharma(model15.sub)
+
+model15_null.sub <- glmmTMB(tr_elo_at_end_tenure_all ~ 1,
+                      data = emigrants_with_elo_all_sub, family = beta_family())
+anova(model15.sub, model15_null.sub, test="Chisq")
+#significant with all conflicts
+
+drop1(model15.sub, test="Chisq")
+#again not significant interaction
+
+summary(model15.sub)
+
+#check removing the interaction
+model15.sub.noint <- glmmTMB(tr_elo_at_end_tenure_all ~ Tenure+ImmigrationGp1,
+                      data = emigrants_with_elo_all_sub, family = beta_family())
+check_lmer_assumptions_dharma(model15.sub.noint)
+#no outliers detected now and it is the best fit
+
+AIC(model15.sub, model15, model15.sub.noint)
+
+model15.sub.noint_null <- glmmTMB(tr_elo_at_end_tenure_all ~ 1,
+                      data = emigrants_with_elo_all_sub, family = beta_family())
+anova(model15.sub.noint,model15.sub.noint_null)
+drop1(model15.sub.noint, test="Chisq")
+
+summary(model15.sub.noint)
+```
+
+## Models: Male-Male Conflicts
+
+```{r}
+## Repeat male-male conflicts
+model15_mm <- glmmTMB(tr_elo_at_end_tenure_male_male ~ Tenure*ImmigrationGp1,
+                      data = emigrants_with_elo_male_male, family = beta_family())
+check_lmer_assumptions_dharma(model15_mm)
+#overdispersion
+
+#subgroup exclusion
+emigrants_with_elo_male_male_sub <- subset(emigrants_with_elo_male_male, !ImmigrationGp1 %in% c("LT", "CR"))
+
+model15_mm <- glmmTMB(tr_elo_at_end_tenure_male_male ~ Tenure*ImmigrationGp1,
+                      data = emigrants_with_elo_male_male_sub, family = beta_family())
+check_lmer_assumptions_dharma(model15_mm)
+#still overdispersed with and without interaction and when including dispersion parameters
+
+#check where is the problem
+# Compare sample sizes and distributions
+cat("All conflicts dataset: n =", nrow(emigrants_with_elo_all_sub), "\n")
+cat("Male-male dataset: n =", nrow(emigrants_with_elo_male_male), "\n")
+
+# Compare Elo distributions
+par(mfrow = c(1, 2))
+hist(emigrants_with_elo_all_sub$tr_elo_at_end_tenure_all,
+     main = "All Conflicts Elo", xlab = "Elo", breaks = 20)
+hist(emigrants_with_elo_male_male$tr_elo_at_end_tenure_male_male,
+     main = "Male-Male Elo", xlab = "Elo", breaks = 20)
+par(mfrow = c(1, 1))
+
+# Check for extreme values
+summary(emigrants_with_elo_all_sub$tr_elo_at_end_tenure_all)
+summary(emigrants_with_elo_male_male$tr_elo_at_end_tenure_male_male)
+
+# Check for 0s and 1s (even after transformation)
+sum(emigrants_with_elo_male_male$tr_elo_at_end_tenure_male_male %in% c(0, 1, 0.0001, 0.9999))
+```
+
+## Separate Analysis: Moderate vs Top-Ranked Males
+
+The male distribution has a huge peak close to 1 which is making the beta distribution angry. We are going to analyse these extremes separately but they really seem to be two strategies.
+
+```{r}
+#the male distribution has a huge peak close to 1 which is making the beta distribution angry
+#we are going to analyse these extremes separately but they really seem to be two strategies
+
+# Separate extreme from non-extreme
+emigrants_mm_moderate <- emigrants_with_elo_male_male %>%
+  filter(tr_elo_at_end_tenure_male_male < 0.99)  # Exclude near-ceiling
+
+emigrants_mm_extreme <- emigrants_with_elo_male_male %>%
+  filter(tr_elo_at_end_tenure_male_male >= 0.99)  # Top-ranked males
+
+cat("Moderate rank males:", nrow(emigrants_mm_moderate), "\n")
+cat("Top-ranked males:", nrow(emigrants_mm_extreme), "\n")
+
+# Analyze moderate ranks with beta regression
+model15_mm_moderate <- glmmTMB(
+  tr_elo_at_end_tenure_male_male ~ Tenure+ImmigrationGp1, 
+  data = emigrants_mm_moderate, 
+  family = beta_family())
+
+#not significant interaction 
+check_lmer_assumptions_dharma(model15_mm_moderate)
+#happy
+
+library(ggplot2)
+ggplot(emigrants_mm_moderate, aes(x = Tenure, y = tr_elo_at_end_tenure_male_male)) +
+  geom_point() +
+  geom_smooth(method = "loess") +
+  facet_wrap(~ImmigrationGp1)
+
+# Test significance
+model15_mm_moderate_null <- glmmTMB(
+  tr_elo_at_end_tenure_male_male ~ 1, 
+  data = emigrants_mm_moderate, 
+  family = beta_family())
+
+anova(model15_mm_moderate, model15_mm_moderate_null, test = "Chisq")
+drop1(model15_mm_moderate, test = "Chisq")
+
+summary(model15_mm_moderate)
+
+#repeat model excluding less habituated groups
+emigrants_mm_moderate_sub <- subset(emigrants_mm_moderate, ImmigrationGp1 != c("LT", "CR"))
+
+model15_mm_moderate_sub <- glmmTMB(
+  tr_elo_at_end_tenure_male_male ~ Tenure+ImmigrationGp1, 
+  data = emigrants_mm_moderate_sub, 
+  family = beta_family())
+
+check_lmer_assumptions_dharma(model15_mm_moderate_sub)
+#happy
+
+model15_mm_moderate_null_sub <- glmmTMB(
+  tr_elo_at_end_tenure_male_male ~ 1, 
+  data = emigrants_mm_moderate_sub, 
+  family = beta_family())
+
+anova(model15_mm_moderate_sub, model15_mm_moderate_null_sub, test = "Chisq")
+drop1(model15_mm_moderate_sub, test = "Chisq")
+
+#pairwise comparisons
+emm_groups <- emmeans(model15_mm_moderate_sub, ~ ImmigrationGp1)
+
+# Pairwise comparisons between all groups
+pairwise_comparisons <- pairs(emm_groups, adjust = "tukey")
+summary(pairwise_comparisons)
+#AK-BD differ
+```
+
+Males immigrating to BD achieve significantly higher competitive rankings (Elo) at the end of their tenure compared to males immigrating to AK. All other groups are statistically similar to each other.
+
+## Top-Ranked Males: Does Tenure Predict Reaching Top Rank?
+
+```{r}
+# Logistic regression: top rank (yes/no) ~ tenure
+emigrants_with_elo_male_male$top_rank <- 
+  emigrants_with_elo_male_male$tr_elo_at_end_tenure_male_male >= 0.99
+
+# Logistic model
+model_top_rank <- glmmTMB(
+  top_rank ~ Tenure+ImmigrationGp1, 
+  data = emigrants_with_elo_male_male, 
+  family = binomial())
+
+model_top_rank_null <- glmmTMB(
+  top_rank ~ 1, 
+  data = emigrants_with_elo_male_male, 
+  family = binomial())
+
+check_lmer_assumptions_dharma(model_top_rank)
+
+anova(model_top_rank, model_top_rank_null)
+
+summary(model_top_rank)
+drop1(model_top_rank, test = "Chisq")
+
+#repeat with most habituated groups
+emigrants_with_elo_male_male_sub$top_rank <- 
+  emigrants_with_elo_male_male_sub$tr_elo_at_end_tenure_male_male >= 0.99
+
+model_top_rank <- glmmTMB(
+  top_rank ~ Tenure+ImmigrationGp1, 
+  data = emigrants_with_elo_male_male_sub, 
+  family = binomial())
+
+model_top_rank_null <- glmmTMB(
+  top_rank ~ 1, 
+  data = emigrants_with_elo_male_male_sub, 
+  family = binomial())
+
+check_lmer_assumptions_dharma(model_top_rank)
+
+anova(model_top_rank, model_top_rank_null)
+
+summary(model_top_rank)
+drop1(model_top_rank, test = "Chisq")
+
+# Interpretation: Does longer tenure increase probability of reaching top rank? nop
+```
+
+## Define Colors
+
+```{r}
+all_groups <- c("AK", "BD", "CR", "IF", "KB", "LT", "NH")
+group_colors <- c(
+  "AK" = "#00CC99",
+  "BD" = "#1F78B4", 
+  "CR" = "#7570B3",
+  "IF" = "#660000",
+  "KB" = "#336633",
+  "LT" = "#E6AB02",
+  "NH" = "#FF6600")
+```
+
+# Visualizations
+
+```{r}
+library(ggeffects)
+library(ggplot2)
+library(patchwork)
+
+# Custom colors
+all_groups <- c("AK", "BD", "CR", "IF", "KB", "LT", "NH")
+group_colors <- c(
+  "AK" = "#00CC99",
+  "BD" = "#1F78B4", 
+  "CR" = "#7570B3",
+  "IF" = "#660000",
+  "KB" = "#336633",
+  "LT" = "#E6AB02",
+  "NH" = "#FF6600")
+
+# === PLOT 1: All Conflicts (with group sample sizes) ===
+pred_all <- ggpredict(model15.sub.noint, terms = "Tenure [all]")
+
+
+# Add group sample sizes for Plot 1
+group_counts_all <- emigrants_with_elo_all_sub %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels_all <- setNames(group_counts_all$label, group_counts_all$ImmigrationGp1)
+
+plot1 <- ggplot() +
+  geom_ribbon(data = as.data.frame(pred_all),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey50") +
+  geom_line(data = as.data.frame(pred_all),
+            aes(x = x, y = predicted),
+            size = 1.5, color = "black") +
+  geom_point(data = emigrants_with_elo_all_sub,
+             aes(x = Tenure, y = tr_elo_at_end_tenure_all, color = ImmigrationGp1),
+             size = 3, alpha = 0.7) +
+  annotate("text", x = -Inf, y = Inf, label = "A",
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = group_colors, labels = group_labels_all) +
+  guides(color = guide_legend(nrow = 3, byrow = TRUE)) +
+  labs(x = "Tenure (Days)",
+       y = "Elo Rating at End of Tenure\n(All Conflicts)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === PLOT 2: Male-Male Moderate Ranks ===
+pred_mm_moderate <- ggpredict(model15_mm_moderate, terms = c("Tenure [all]", "ImmigrationGp1"))
+
+group_counts_mm <- emigrants_mm_moderate %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels_mm <- setNames(group_counts_mm$label, group_counts_mm$ImmigrationGp1)
+
+plot2 <- ggplot() +
+  geom_ribbon(data = as.data.frame(pred_mm_moderate),
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              alpha = 0.1, color = NA) +
+  geom_line(data = as.data.frame(pred_mm_moderate),
+            aes(x = x, y = predicted, color = group),
+            size = 1.5) +
+  geom_point(data = emigrants_mm_moderate,
+             aes(x = Tenure, y = tr_elo_at_end_tenure_male_male, color = ImmigrationGp1),
+             size = 3, alpha = 0.7) +
+  annotate("text", x = -Inf, y = Inf, label = "B",
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = group_colors, labels = group_labels_mm) +
+  guides(color = guide_legend(nrow = 3, byrow = TRUE)) +
+  scale_fill_manual(values = group_colors, guide = "none") +
+  labs(x = "Tenure (Days)",
+       y = "Elo Rating at End of Tenure\n(Male-Male, Elo < 0.99)",
+       color = NULL,
+       fill = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === PLOT 3: Top Rank Probability (shortened "t" instead of "top") ===
+# Convert top_rank to numeric (0/1) instead of logical (TRUE/FALSE)
+emigrants_with_elo_male_male$top_rank <- 
+  as.numeric(emigrants_with_elo_male_male$tr_elo_at_end_tenure_male_male >= 0.99)
+
+# Now fit the model with numeric top_rank
+model_top_rank <- glmmTMB(
+  top_rank ~ Tenure + ImmigrationGp1, 
+  data = emigrants_with_elo_male_male, 
+  family = binomial())
+
+pred_top_rank <- ggpredict(model_top_rank, terms = c("Tenure [all]", "ImmigrationGp1"))
+
+group_counts_top <- emigrants_with_elo_male_male %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(
+    n = n(),
+    n_top = sum(as.numeric(top_rank))  # Convert factor to numeric, subtract 1
+  ) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ", t=", n_top, ")"))
+
+group_labels_top <- setNames(group_counts_top$label, group_counts_top$ImmigrationGp1)
+
+plot3 <- ggplot() +
+  geom_ribbon(data = as.data.frame(pred_top_rank),
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              alpha = 0.1, color = NA) +
+  geom_line(data = as.data.frame(pred_top_rank),
+            aes(x = x, y = predicted, color = group),
+            size = 1.5) +
+  geom_point(data = emigrants_with_elo_male_male,
+             aes(x = Tenure, y = as.numeric(top_rank), color = ImmigrationGp1),
+             size = 3, alpha = 0.7,
+             position = position_jitter(height = 0.02, width = 0)) +
+  annotate("text", x = -Inf, y = Inf, label = "C",
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = group_colors, labels = group_labels_top) +
+  scale_fill_manual(values = group_colors, labels = group_labels_top) +
+  guides(color = guide_legend(nrow = 3, byrow = TRUE), fill = "none") +
+  scale_y_continuous(breaks = c(0, 1), labels = c("No", "Yes")) +
+  labs(x = "Tenure (Days)",
+       y = "Reached Top Rank\n(Elo ≥ 0.99)",
+       color = NULL,
+       fill = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === COMBINE PLOTS in 1 row x 3 columns ===
+combined_plot <- plot1 | plot2 | plot3
+print(combined_plot)
+```
+
+# Characteristics of Top-Ranked Males
+
+**Note:** This chunk can only be run after script six (6. Analyses_socbehav_matrank) has been run.
+
+```{r, eval = FALSE}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Analyses/sex_ratio_calculator_fnct.R")
+
+# Extract the top-ranked males from each dataset 
+top_ranked_males <- emigrants_mm_extreme$Code
+
+emigrants_top_ranked <- emigrants %>%
+  filter(Code %in% top_ranked_males)
+
+network_grooming_top_ranked <- xdata_groom_all %>%
+  filter(immigrant_code %in% top_ranked_males)
+
+network_proximity_top_ranked <- xdata_scan_sub %>%
+  filter(immigrant_code %in% top_ranked_males)
+
+# Combine all information
+top_ranked_table <- emigrants_top_ranked %>%
+  left_join(network_grooming_top_ranked, 
+            by = c("Code"="immigrant_code"),
+            suffix = c("", "_groom")) %>%
+  left_join(network_proximity_top_ranked, 
+            by = c("Code"="immigrant_code"),
+            suffix = c("", "_prox"))
+
+#calculate sex ratio on dispersing groups
+top_ranked_table <- calculate_sex_ratio_at_immigration(
+  emigrants = top_ranked_table,
+  life_hist = life_hist,
+  group_presence_matrices = group_presence_matrices)
+
+# Select relevant columns
+top_ranked_summary <- top_ranked_table %>%
+  select(Code, ImmigrationGp1, Tenure, BirthGp,
+         grooming_rate, eigenvector_centrality, total_degree_normalized, degree_normalized, strength_assoc, eigenvector_centrality_prox = eigenvector_centrality_prox, DateImmigration1, sex_ratio_mf, prop_male)  # from proximity
+
+# Create a nice table
+kable(top_ranked_summary,
+      caption = "Top-Ranked Males: Demographics and Network Metrics",
+      digits = 2,
+      col.names = c("Name", "Group", "Tenure (days)", "Birth Group",
+                    "Grooming Rate", "Eigen. Centrality (Groom)", "Groom degree", "Prox. degree", "Association Strength", "Eigen. Centrality (Prox)", "Immigration date", "Sex ratio ImmGp", "Proportion males")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+library(flextable)
+ft <- flextable(top_ranked_summary) %>%
+  set_caption("Top-Ranked Males: Demographics and Network Metrics") %>%
+  colformat_double(digits = 2) %>%
+  autofit()
+
+summary(top_ranked_table$sex_ratio_mf)
+
+#compare to non-top ranking
+emigrants <- calculate_sex_ratio_at_immigration(
+  emigrants = emigrants,
+  life_hist = life_hist,
+  group_presence_matrices = group_presence_matrices)
+
+non_top_ranking_males <- emigrants %>%
+  filter(!Code %in% top_ranked_table$Code) %>%
+  left_join(xdata_groom_all %>% 
+              select(Code = immigrant_code, grooming_rate, eigenvector_centrality, total_degree_normalized),
+            by = "Code") %>%
+  left_join(xdata_scan_sub %>% 
+            select(Code = immigrant_code, strength_assoc, eigenvector_centrality_prox = eigenvector_centrality, degree_normalized),
+            by = "Code")
+
+# Compare sex ratios
+cat("=== TOP-RANKING MALES (Elo >= 0.99) ===\n")
+cat("N =", nrow(top_ranked_table), "\n")
+summary(top_ranked_table[, c("total_group_size", "sex_ratio_mf", "prop_male", "prop_unknown_sex")])
+
+cat("\n=== NON-TOP-RANKING MALES (Elo < 0.99) ===\n")
+cat("N =", nrow(non_top_ranking_males), "\n")
+summary(non_top_ranking_males[, c("total_group_size", "sex_ratio_mf", "prop_male", "prop_unknown_sex")])
+
+# t-test for sex ratio
+t_test_ratio <- t.test(top_ranked_table$sex_ratio_mf, 
+                       non_top_ranking_males$sex_ratio_mf,
+                      na.action = na.omit)
+print(t_test_ratio)
+#not significantly different
+
+# Define variables to test
+test_vars <- c(
+  sex_ratio_mf = "Sex Ratio (M/F)",
+  prop_male = "Proportion Male",
+  total_group_size = "Group Size at Immigration",
+  Tenure = "Tenure",
+  grooming_rate = "Grooming Rate",
+  eigenvector_centrality = "Eigenvector Centrality (Grooming)",
+  total_degree_normalized = "Total Degree Normalized",
+  strength_assoc = "Association Strength (Proximity)",
+  eigenvector_centrality_prox = "Eigenvector Centrality (Proximity)",
+  degree_normalized = "Degree Normalized (Proximity)")
+
+results_list <- list()
+effect_sizes <- list()
+
+library(effsize)
+for (var in names(test_vars)) {
+  
+  # t-test
+  t_result <- t.test(top_ranked_table[[var]], 
+                     non_top_ranking_males[[var]],
+                    var.equal = FALSE,#this is the Welch correction to control for sample size imbalance and potential differences in
+                     na.action = na.omit)
+  
+  # Effect size
+  cohen <- cohen.d(top_ranked_table[[var]], 
+                   non_top_ranking_males[[var]],
+                   na.rm = TRUE)
+
+  # Store results
+  results_list[[var]] <- list(
+    variable = test_vars[var],
+    top_mean = mean(top_ranked_table[[var]], na.rm = TRUE),
+    top_sd = sd(top_ranked_table[[var]], na.rm = TRUE),
+    non_top_mean = mean(non_top_ranking_males[[var]], na.rm = TRUE),
+    non_top_sd = sd(non_top_ranking_males[[var]], na.rm = TRUE),
+    t_statistic = t_result$statistic,
+    df = t_result$parameter,
+    p_value = t_result$p.value,
+    cohen_d = cohen$estimate,
+    magnitude = cohen$magnitude
+  )
+}
+
+# Print effect sizes summary
+cat("\n=== EFFECT SIZES (Cohen's d) ===\n")
+for (var in names(results_list)) {
+  cat(sprintf("%s: d = %.3f (%s), t(%.1f) = %.3f, p = %.4f\n", 
+              results_list[[var]]$variable,
+              results_list[[var]]$cohen_d,
+              results_list[[var]]$magnitude,
+              results_list[[var]]$df,
+              results_list[[var]]$t_statistic,
+              results_list[[var]]$p_value))
+}
+
+results_table <- do.call(rbind, lapply(names(results_list), function(var) {
+  data.frame(
+    Variable = results_list[[var]]$variable,
+    Cohen_d = results_list[[var]]$cohen_d,
+    Magnitude = results_list[[var]]$magnitude,
+    df = results_list[[var]]$df,
+    t_statistic = results_list[[var]]$t_statistic,
+    p_value = results_list[[var]]$p_value
+  )
+}))
+
+save_as_docx(ft, path = "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/top_ranked_males_table.docx")
+
+write.csv(results_table, "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/top_nontop_effect_sizes_table.csv", row.names = FALSE)
+```
+
+---
+
+**Analysis completed:** `r Sys.Date()`

@@ -1,0 +1,392 @@
+---
+title: "Tenure Analysis"
+author: "Alba Motes Rodrigo"
+date: "2025-08-12"
+output: 
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  error = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+<style>
+h1 {
+  font-size: 32px;
+  font-weight: bold;
+}
+h2 {
+  font-size: 26px;
+  font-weight: bold;
+}
+h3 {
+  font-size: 22px;
+  font-weight: bold;
+}
+</style>
+
+# Load Packages and Data
+
+Evaluation of whether maternal rank influences tenure in the first immigration.
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(ggeffects)
+library(glmmTMB)
+
+# load life history IVP, conflict data and group_presence matrices
+load("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/Immigrants_environment.RData")
+
+#remove columns without names
+group_presence_matrices <- lapply(group_presence_matrices, function(mat) {
+    valid_cols <- !is.na(colnames(mat)) & colnames(mat) != "" & colnames(mat) != " "
+    mat[, valid_cols, drop = FALSE]
+  })
+```
+
+```{r}
+emigrants<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/All_potential_immigrants.csv")
+```
+
+# Calculate Mother Elo Ratings
+
+For those mothers that were there at least 1 year present during the juvenile period, calculate elo ratings.
+
+```{r}
+#for those mothers that were there at least 1 year present during the juvenile period, calculate elo ratings
+emigrants_with_mom<-subset(emigrants, mother_days_present >= 365 & !is.na(mother_days_present))
+
+calculate_mother_elo <- function(emigrants_with_mom, female_conflict_data, group_presence_matrices, life_hist) {
+  # Load EloRating package if not already loaded
+  if(!require("EloRating")) {
+    install.packages("EloRating")
+    library(EloRating)
+  }
+  
+  # Convert dates to Date objects if they aren't already
+  emigrants_with_mom$DOB <- as.Date(emigrants_with_mom$DOB)
+  emigrants_with_mom$third_birthday <- as.Date(emigrants_with_mom$third_birthday)
+  female_conflict_data$date <- as.Date(female_conflict_data$date)
+  
+  # Sort conflict data by date
+  female_conflict_data <- female_conflict_data[order(female_conflict_data$date), ]
+  
+  # Initialize column for mother's average Elo rating
+  emigrants_with_mom$mother_avg_elo <- NA
+  
+  # Process each group separately
+  all_groups <- unique(emigrants_with_mom$BirthGp)
+  
+  for(group in all_groups) {
+    # Skip if group is NA
+    if(is.na(group)) next
+    
+    # Get presence data for this group
+    presence_data <- group_presence_matrices[[group]]
+      
+    # Skip if no presence data
+    if(is.null(presence_data)) {
+      message(paste("No presence data for group:", group))
+      next
+    }
+    
+    # Get all individuals in the presence data (excluding the Date column)
+    presence_individuals <- colnames(presence_data)[-1]  # Exclude first column (Date)
+    
+    # Make sure presence_data is numeric (except for the Date column)
+    for(col in 2:ncol(presence_data)) {
+      if(!is.numeric(presence_data[, col])) {
+        message(paste("Converting column", col, "to numeric in presence data for group:", group))
+        presence_data[, col] <- as.numeric(as.character(presence_data[, col]))
+      }
+    }
+    
+    # Get conflict data for this group
+    group_conflicts <- female_conflict_data[female_conflict_data$group == group, ]
+    # Skip if no conflict data
+    if(nrow(group_conflicts) == 0) {
+      message(paste("No conflict data for group:", group))
+      next
+    }
+   
+    #Filter out conflicts where either winner or loser is not in presence data because it is from a different group
+    group_conflicts <- group_conflicts[
+      group_conflicts$winner %in% presence_individuals & 
+      group_conflicts$loser %in% presence_individuals, ]
+  
+    # Find first observation dates and filter conflicts
+    first_observation_dates <- sapply(presence_individuals, function(ind) {
+      ind_idx <- which(presence_data[[ind]] > 0)
+      if(length(ind_idx) > 0) presence_data$Date[min(ind_idx)] else as.Date("9999-12-31")
+    })
+    
+    # Keep only conflicts where both participants have been observed
+    valid_conflicts <- sapply(1:nrow(group_conflicts), function(i) {
+      winner <- group_conflicts$winner[i]
+      loser <- group_conflicts$loser[i]
+      conflict_date <- group_conflicts$date[i]
+      
+      return(conflict_date >= first_observation_dates[[winner]] &&
+             conflict_date >= first_observation_dates[[loser]])
+    })
+    
+    group_conflicts <- group_conflicts[valid_conflicts, ]
+    
+    # Calculate Elo ratings for this group
+    tryCatch({
+      elo_ratings <- elo.seq(winner = group_conflicts$winner,
+                          loser = group_conflicts$loser,
+                          Date = group_conflicts$date,
+                          draw = NULL,
+                          
+                          presence = presence_data,
+                          
+                          runcheck = F)
+      
+      # For each mother in this group
+      mothers_in_group <- emigrants_with_mom[!is.na(emigrants_with_mom$Momcode) &
+                                        emigrants_with_mom$BirthGp == group, ]
+      
+      for(i in 1:nrow(mothers_in_group)) {
+        # Get mother code
+        mom_code <- mothers_in_group$Momcode[i]
+        
+        # Check if mother exists in the Elo ratings
+        if(!mom_code %in% colnames(elo_ratings$pmat)) {
+          message(paste("Mother", mom_code, "not found in Elo ratings for group", group))
+          next
+        }
+        
+        # Get birth date (when we want to extract the Elo rating)
+        birth_date <- mothers_in_group$DOB[i]
+        end_date <- mothers_in_group$third_birthday[i]
+        
+        # Skip if invalid dates
+        if(is.na(birth_date) || is.na(end_date)) {
+          message(paste("Invalid dates for mother", mom_code, "in group", group))
+          next
+        }
+        
+        # Calculate the date range in days (from birth to 3 years)
+        date_range <- as.numeric(difftime(end_date, birth_date, units = "days"))
+        
+        # Extract the Elo rating on the birth date with a range to include the juvenile period
+        tryCatch({
+          # Convert birth_date to character in the format the function expects
+          birth_date_char <- format(birth_date, "%Y-%m-%d")
+          
+          # Extract Elo ratings for the mother during the juvenile period
+          mom_ratings <- extract_elo(elo_ratings,
+                                   extractdate = birth_date_char,
+                                  daterange = date_range,
+                                  IDs = mom_code,
+                                  standardize=T)
+          
+          # Calculate average scaled Elo if ratings exist
+          if(!is.null(mom_ratings) && length(mom_ratings) > 0) {
+            
+            # Calculate average
+            avg_scaled_elo <- mean(mom_ratings, na.rm = TRUE)
+            
+            # Store in the result dataframe
+            idx <- which(emigrants_with_mom$Momcode == mom_code &
+                        emigrants_with_mom$DOB == birth_date)
+            
+            if(length(idx) > 0) {
+              emigrants_with_mom$mother_avg_elo[idx] <- avg_scaled_elo
+              message(paste("Calculated average Elo for mother", mom_code, "in group", group, ":", avg_scaled_elo))
+            }
+          } else {
+            message(paste("No ratings found for mother", mom_code, "in group", group, "during juvenile period"))
+          }
+        }, error = function(e) {
+          message(paste("Error extracting Elo for mother", mom_code, "in group", group, ":", e$message))
+        })
+      }
+    }, error = function(e) {
+      message(paste("Error calculating Elo ratings for group", group, ":", e$message))
+    })
+  }
+  
+  return(emigrants_with_mom)
+}
+
+# Run the analysis
+emigrants_with_mom <- calculate_mother_elo(emigrants_with_mom, female_conflict_data, group_presence_matrices, life_hist)
+```
+
+# Statistical Models
+
+```{r}
+#exclude those cases where tenure is 0 because this is likely due to the group not being followed. These males dont have second immigrations that could be considered they first successful emigration so I cant take them. hei also needs to be excluded because the naming of the monkey is wrong
+emigrants_with_mom<-subset(emigrants_with_mom, Tenure!=0 )
+emigrants_with_mom<-subset(emigrants_with_mom, Code!="hei" )
+
+library(lubridate)
+emigrants_with_mom$year_imm<-year(emigrants_with_mom$DateImmigration1)
+
+library(lme4)
+complete_data_tenure <- emigrants_with_mom[complete.cases(emigrants_with_mom[c("mother_avg_elo", "ImmigrationGp1")]), ]
+
+#does mother elo predict tenure in first immigration
+tenure_model<-glmmTMB(Tenure ~ mother_avg_elo*ImmigrationGp1 , data= complete_data_tenure, family=nbinom2)
+tenure_model_null<-glmmTMB(Tenure ~ 1  , data= complete_data_tenure, family=nbinom2)
+anova(tenure_model,tenure_model_null, test="Chisq")
+
+library(DHARMa)
+simulationOutput <- simulateResiduals(fittedModel = tenure_model, plot = F)
+plot(simulationOutput)
+testDispersion(simulationOutput)   
+
+summary(tenure_model)
+drop1(tenure_model, test = "Chisq")
+
+#interaction not significant
+#no int
+tenure_model_noint<-glmmTMB(Tenure ~ mother_avg_elo+ImmigrationGp1 , data= complete_data_tenure, family=nbinom2)
+tenure_model_null_noint<-glmmTMB(Tenure ~ ImmigrationGp1 , data= complete_data_tenure, family=nbinom2)
+
+simulationOutput <- simulateResiduals(fittedModel = tenure_model_noint, plot = F)
+plot(simulationOutput)
+testDispersion(simulationOutput)   
+
+anova(tenure_model_noint,tenure_model_null_noint, test="Chisq")
+drop1(tenure_model_noint, test = "Chisq")
+
+#repeat without LT and CR
+sub_complete_data_tenure <- subset(complete_data_tenure, !ImmigrationGp1 %in% c("LT", "CR"))
+
+tenure_model_sub<-glmmTMB(Tenure ~ mother_avg_elo*ImmigrationGp1 , data= sub_complete_data_tenure, family=nbinom2)
+tenure_model_null_sub<-glmmTMB(Tenure ~ 1  , data= sub_complete_data_tenure, family=nbinom2)
+anova(tenure_model_sub,tenure_model_null_sub, test="Chisq")
+
+#also not significant without LT and CR, chisq=7.567, df= 6, p= 0.2715
+drop1(tenure_model_sub, test="Chisq")
+```
+
+# Visualizations
+
+## Effect of Mother Rank on Tenure (All Groups)
+
+```{r}
+model <- glmmTMB(Tenure ~ mother_avg_elo + ImmigrationGp1,
+                 family = nbinom2, data = complete_data_tenure)
+
+# Get population-level predictions
+predictions <- ggpredict(model, terms = "mother_avg_elo [0:1 by=0.01]")
+
+# Custom colors
+custom_colors <- c("#00CC99", "#1F78B4", "#7570B3", "#660000", "#336633", "#E6AB02", "#FF6600")
+
+# Count per group for labels
+group_counts <- complete_data_tenure %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$ImmigrationGp1)
+
+# Plot with dots colored by group
+plot1 <- ggplot() + 
+  # Ribbon and line first
+  geom_ribbon(data = predictions,
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = predictions,
+            aes(x = x, y = predicted),
+            color = "black", linewidth = 1) +
+  # Points colored by group
+  geom_point(data = complete_data_tenure,
+            aes(x = mother_avg_elo, y = Tenure, color = ImmigrationGp1), 
+            size = 3, alpha = 0.7) +
+  scale_color_manual(values = custom_colors, labels = group_labels) +
+  xlim(0, 1) +
+  labs(x = "Mother Elo Rating",
+       y = "Tenure (Days)",
+      color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 16),
+        legend.spacing.y = unit(-0.1, "cm")) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+print(plot1)
+
+summary(complete_data_tenure$mother_avg_elo)
+range(complete_data_tenure$mother_avg_elo)
+```
+
+## Effect of Mother Rank on Tenure (4 Groups Only)
+
+```{r}
+model_sub<-glmmTMB(Tenure ~ mother_avg_elo+ImmigrationGp1 , data= sub_complete_data_tenure, family=nbinom2)
+
+# Get population-level predictions
+predictions <- ggpredict(model_sub, terms = "mother_avg_elo [0:1 by=0.01]")
+
+# Custom colors
+custom_colors <- c("#00CC99", "#1F78B4", "#7570B3", "#660000", "#336633", "#E6AB02", "#FF6600")
+
+# Count per group for labels
+group_counts <- sub_complete_data_tenure %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$ImmigrationGp1)
+
+# Plot with dots colored by group
+plot2_sub <- ggplot() + 
+  # Ribbon and line first
+  geom_ribbon(data = predictions,
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = predictions,
+            aes(x = x, y = predicted),
+            color = "black", linewidth = 1) +
+  # Points colored by group
+  geom_point(data = sub_complete_data_tenure,
+            aes(x = mother_avg_elo, y = Tenure, color = ImmigrationGp1), 
+            size = 3, alpha = 0.7) +
+  scale_color_manual(values = custom_colors, labels = group_labels) +
+  xlim(0, 1) +
+  labs(x = "Mother Elo Rating",
+       y = "Tenure (Days, 4 groups only)",
+      color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 16),
+        legend.spacing.y = unit(-0.1, "cm")) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+print(plot2_sub)
+
+summary(complete_data_tenure$mother_avg_elo)
+range(complete_data_tenure$mother_avg_elo)
+```
+
+---
+
+**Analysis completed:** `r Sys.Date()`

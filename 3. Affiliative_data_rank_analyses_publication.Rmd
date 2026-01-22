@@ -1,0 +1,664 @@
+---
+title: "Grooming Network Analysis"
+author: "Alba Motes Rodrigo"
+date: "2025-05-08"
+output: 
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  error = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+<style>
+h1 {
+  font-size: 32px;
+  font-weight: bold;
+}
+h2 {
+  font-size: 26px;
+  font-weight: bold;
+}
+h3 {
+  font-size: 22px;
+  font-weight: bold;
+}
+</style>
+
+# Load Packages and Data
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(igraph)
+library(purrr)
+```
+
+```{r}
+load("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/Immigrants_environment.RData")
+affiliative<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Diffusion_vervets/IVP_data/adlib/affiliative.csv")
+potential_immig<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/All_potential_immigrants.csv")
+```
+
+# Reshape Affiliative Data
+
+Add rows for additional individuals in affiliative data. Individual 3 and 4, behaviour 3 and 4, and interaction 2 need to be added as additional rows keeping the same date, time, group, context, data (same for indiv 5 and 6).
+
+```{r}
+reshape_affiliative_data <- function(data) {
+# Create the base dataset with primary interactions (individuals 1 & 2)
+  base_data <- data %>%
+    select(-idindividual3, -behaviourindiv3, -idindividual4, -behaviourindiv4, -interaction2,
+           -idindividual5, -behaviourindiv5, -idindividual6, -behaviourindiv6, -interaction3)
+  
+  # Create additional rows for individuals 3 & 4 (interaction2)
+  additional_data_34 <- data %>%
+    filter(!is.na(idindividual3) & idindividual3 != "" &
+           !is.na(idindividual4) & idindividual4 != "") %>%
+    mutate(
+      idindividual1 = idindividual3,
+      behaviourindiv1 = behaviourindiv3,
+      idindividual2 = idindividual4,
+      behaviourindiv2 = behaviourindiv4,
+      interaction = interaction2
+    ) %>%
+    select(-idindividual3, -behaviourindiv3, -idindividual4, -behaviourindiv4, -interaction2,
+           -idindividual5, -behaviourindiv5, -idindividual6, -behaviourindiv6, -interaction3)
+  
+  # Create additional rows for individuals 5 & 6 (interaction3)
+  additional_data_56 <- data %>%
+    filter(!is.na(idindividual5) & idindividual5 != "" &
+           !is.na(idindividual6) & idindividual6 != "") %>%
+    mutate(
+      idindividual1 = idindividual5,
+      behaviourindiv1 = behaviourindiv5,
+      idindividual2 = idindividual6,
+      behaviourindiv2 = behaviourindiv6,
+      interaction = interaction3
+    ) %>%
+    select(-idindividual3, -behaviourindiv3, -idindividual4, -behaviourindiv4, -interaction2,
+           -idindividual5, -behaviourindiv5, -idindividual6, -behaviourindiv6, -interaction3)
+  
+  # Combine all data
+  reshaped_data <- bind_rows(base_data, additional_data_34, additional_data_56) %>%
+    filter(!is.na(idindividual1) & idindividual1 != "" &
+           !is.na(idindividual2) & idindividual2 != "") %>%
+    arrange(date, time)
+  
+  # Print summary
+  cat("Original data:", nrow(data), "rows\n")
+  cat("Reshaped data:", nrow(reshaped_data), "rows\n")
+  cat("Additional rows created:", nrow(reshaped_data) - nrow(data), "\n")
+  cat("Rows from individual3/4:", nrow(additional_data_34), "\n")
+  cat("Rows from individual5/6:", nrow(additional_data_56), "\n")
+  
+  return(reshaped_data)
+}
+
+affiliative <- reshape_affiliative_data(affiliative)
+```
+
+# Filter Grooming Interactions
+
+Keep only interactions that involve grooming (gr or bgr).
+
+```{r}
+# Keep only interactions that involve grooming (gr or bgr)
+valid_codes <- c("gr", "bgr")  # Changed to plural and vector
+
+contains_valid <- function(combined_code) {
+  # Handle NA values
+  if (is.na(combined_code)) return(FALSE)
+  
+  # Convert to lowercase for case-insensitive matching
+  combined_code <- tolower(as.character(combined_code))
+  
+  # Remove whitespace from before and after for single codes
+  combined_code <- trimws(combined_code)
+  
+  # Check if it's a single code that matches any valid code
+  if (combined_code %in% valid_codes) return(TRUE)
+  
+  # Split the combined code into parts based on both spaces and dots
+  parts <- unlist(strsplit(combined_code, "[\\s\\.]+"))
+  
+  # Remove empty strings that might result from splitting
+  parts <- parts[parts != ""]
+  
+  # Check if any part matches any valid code
+  return(any(parts %in% valid_codes))
+}
+
+# Filter rows where at least one of the columns contains a valid code
+grooming_data <- affiliative[sapply(1:nrow(affiliative), function(i) {
+  contains_valid(affiliative$behaviourindiv1[i]) || 
+  contains_valid(affiliative$behaviourindiv2[i])
+}), ]
+
+# Check that only grooming instances are retained
+get_unique_codes <- function(data, col_names) {
+  # Combine all values from specified columns
+  all_values <- unlist(lapply(col_names, function(col) data[[col]]))
+  # Split by period and get all parts
+  all_parts <- unlist(strsplit(as.character(all_values), "\\."))
+  sort(unique(all_parts))
+}
+
+# Get unique codes from both columns
+unique_codes <- get_unique_codes(grooming_data, c("behaviourindiv1", "behaviourindiv2"))
+length(unique_codes)
+
+unique(grooming_data$group)
+
+#change group names
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK", 
+                        "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing"="CR", "IFamily"="IF")
+
+# Create a new column with abbreviate group names
+affiliative <- affiliative %>%
+mutate(
+    group_Abbreviation = group_abbreviations[group])  # Abbreviate group names
+
+grooming_data<-grooming_data%>%
+mutate(
+    group_Abbreviation = group_abbreviations[group])
+
+#remove rows without group
+affiliative<-affiliative[affiliative$group!="",]
+affiliative$date <- as.Date(affiliative$date)
+grooming_data<-grooming_data[grooming_data$group!="",]
+```
+
+# Standardize Grooming Direction
+
+## Grooming Direction Rules
+
+Modify affiliative data so that individual1 is always the groomer:
+
+- **Rule 1 (Both have gr)**: Creates two directional interactions
+  - Original: individual1 (gr) ↔ individual2 (gr)
+  - Becomes: individual1 (gr) → individual2 + individual2 (gr) → individual1
+
+- **Rule 2 (individual2 has gr, individual1 doesn't)**: Flips everything
+  - Original: individual1 (bgr/other) ← individual2 (gr)
+  - Becomes: individual2 (gr) → individual1 (bgr/other)
+
+- **Rule 3 (individual1 has bgr, individual2 has gr)**: Swaps positions
+  - Original: individual1 (bgr) ← individual2 (gr)
+  - Becomes: individual2 (gr) → individual1 (bgr)
+
+```{r}
+modify_grooming_data <- function(data) {
+# Vectorized helper function to check if behaviors contain specific codes
+  contains_gr <- grepl("\\bgr\\b", tolower(data$behaviourindiv1)) | data$behaviourindiv1 == "gr"
+  contains_gr2 <- grepl("\\bgr\\b", tolower(data$behaviourindiv2)) | data$behaviourindiv2 == "gr"
+  contains_bgr <- grepl("\\bbgr\\b", tolower(data$behaviourindiv1)) | data$behaviourindiv1 == "bgr"
+  contains_bgr2 <- grepl("\\bbgr\\b", tolower(data$behaviourindiv2)) | data$behaviourindiv2 == "bgr"
+  
+  # Handle NA/empty values
+  contains_gr[is.na(data$behaviourindiv1) | data$behaviourindiv1 == ""] <- FALSE
+  contains_gr2[is.na(data$behaviourindiv2) | data$behaviourindiv2 == ""] <- FALSE
+  contains_bgr[is.na(data$behaviourindiv1) | data$behaviourindiv1 == ""] <- FALSE
+  contains_bgr2[is.na(data$behaviourindiv2) | data$behaviourindiv2 == ""] <- FALSE
+  
+  # Identify which rule applies to each row
+  rule1_rows <- contains_gr & contains_gr2  # Both have gr
+  rule2_rows <- contains_gr2 & !contains_gr  # Only individual2 has gr
+  rule3_rows <- contains_bgr & contains_gr2  # individual1 has bgr, individual2 has gr
+  default_rows <- !(rule1_rows | rule2_rows | rule3_rows)  # Keep as is
+  
+  # Create list to store results
+  result_list <- list()
+  
+  # Process Rule 1: Both have gr - create two interactions
+  if(sum(rule1_rows) > 0) {
+    rule1_data <- data[rule1_rows, ]
+    
+    # First interaction: keep individual1 as groomer, empty individual2 behavior
+    interaction1 <- rule1_data
+    interaction1$behaviourindiv2 <- ""
+    
+    # Second interaction: flip so individual2 becomes groomer
+    interaction2 <- rule1_data
+    interaction2$idindividual1 <- rule1_data$idindividual2
+    interaction2$idindividual2 <- rule1_data$idindividual1
+    interaction2$behaviourindiv1 <- "gr"
+    interaction2$behaviourindiv2 <- ""
+    
+    result_list[[1]] <- interaction1
+    result_list[[2]] <- interaction2
+  }
+  
+  # Process Rule 2: Flip when only individual2 has gr
+  if(sum(rule2_rows) > 0) {
+    rule2_data <- data[rule2_rows, ]
+    flipped_data <- rule2_data
+    flipped_data$idindividual1 <- rule2_data$idindividual2
+    flipped_data$idindividual2 <- rule2_data$idindividual1
+    flipped_data$behaviourindiv1 <- rule2_data$behaviourindiv2
+    flipped_data$behaviourindiv2 <- rule2_data$behaviourindiv1
+    
+    result_list[[length(result_list) + 1]] <- flipped_data
+  }
+  
+  # Process Rule 3: Flip when individual1 has bgr and individual2 has gr
+  if(sum(rule3_rows) > 0) {
+    rule3_data <- data[rule3_rows, ]
+    flipped_data <- rule3_data
+    flipped_data$idindividual1 <- rule3_data$idindividual2
+    flipped_data$idindividual2 <- rule3_data$idindividual1
+    flipped_data$behaviourindiv1 <- rule3_data$behaviourindiv2
+    flipped_data$behaviourindiv2 <- rule3_data$behaviourindiv1
+    
+    result_list[[length(result_list) + 1]] <- flipped_data
+  }
+  
+  # Process Default: Keep as is
+  if(sum(default_rows) > 0) {
+    result_list[[length(result_list) + 1]] <- data[default_rows, ]
+  }
+  
+  # Combine all results at once (much faster than repeated rbind)
+  result_data <- do.call(rbind, result_list)
+  
+  # Sort by date and time
+  result_data <- result_data[order(result_data$date, result_data$time), ]
+  
+  # Reset row names
+  rownames(result_data) <- NULL
+  
+  # Print summary
+  cat("Original data:", nrow(data), "rows\n")
+  cat("Modified data:", nrow(result_data), "rows\n")
+  cat("Additional rows created:", nrow(result_data) - nrow(data), "\n")
+  cat("Rule 1 (reciprocal gr):", sum(rule1_rows), "rows ->", sum(rule1_rows) * 2, "rows\n")
+  cat("Rule 2 (flip for gr):", sum(rule2_rows), "rows flipped\n")
+  cat("Rule 3 (bgr/gr swap):", sum(rule3_rows), "rows flipped\n")
+  cat("Unchanged rows:", sum(default_rows), "\n")
+  
+  return(result_data)
+}
+
+grooming_data <- modify_grooming_data(grooming_data)
+```
+
+## Verify Grooming Combinations
+
+```{r}
+# count table of gr/bgr combinations
+get_combination_counts <- function(data) {
+  # Classify behaviors
+ classify <- function(behavior) {
+   if(is.na(behavior) || behavior == "") return("empty")
+   behavior <- tolower(as.character(behavior))
+   if(grepl("\\bgr\\b", behavior) || behavior == "gr") return("gr")
+   if(grepl("\\bbgr\\b", behavior) || behavior == "bgr") return("bgr")
+   return("other")
+ }
+ 
+ behav1 <- sapply(data$behaviourindiv1, classify)
+ behav2 <- sapply(data$behaviourindiv2, classify)
+ 
+ return(table(behav1, behav2))
+}
+
+# Get the counts
+combination_counts <- get_combination_counts(grooming_data)
+print(combination_counts)
+
+#remove combinations where neither behaviour column has gr
+grooming_data <- grooming_data[
+ grepl("\\bgr\\b", tolower(grooming_data$behaviourindiv1)) | 
+ grooming_data$behaviourindiv1 == "gr" |
+ grepl("\\bgr\\b", tolower(grooming_data$behaviourindiv2)) | 
+ grooming_data$behaviourindiv2 == "gr", ]
+
+#Check it worked
+combination_counts <- get_combination_counts(grooming_data)
+print(combination_counts)
+```
+
+## Save and Reload Grooming Data
+
+```{r}
+write.csv(grooming_data, "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/grooming_data2010_2025.csv")
+
+#read grooming_dataset
+grooming_data<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/grooming_data2010_2025.csv")
+```
+
+# Calculate Grooming Network Metrics
+
+## Methodology
+
+Calculate grooming network metrics in the groups where males immigrated from the year post-immigration:
+
+- **Grooming rate**: number of days a given dyad groomed / number of days of adlib data in the year post dispersal
+- **Normalized degree**: number of grooming partners / median group size in that period
+- **Eigenvector centrality**: based on grooming rates
+
+**Procedure:**
+
+1. Obtain all affiliative interactions in each group with an immigrant from the day the male arrived until the day the elo_rating is calculated
+2. Calculate social network metrics:
+   - Grooming rate (following Rachel Harrison and Charlotte Canteloup)
+   - Normalized degree
+   - Eigenvector centrality
+
+**Note:** I use as end date to calculate the metrics the elo rating date considering all conflicts to maximize sample size and because it is the closest to the 1 year mark.
+
+## Prepare Data
+
+```{r}
+#add group abbreviations
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK", 
+                        "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing"="CR", "IFamily"="IF")
+affiliative$group_Abbreviation <- group_abbreviations[affiliative$group]
+```
+
+## Network Metrics Function
+
+```{r}
+#' Calculate Network Metrics for Immigrant Males
+#'
+#' @param potential_immig Data frame with immigrant information including:
+#'   - Code: Individual ID
+#'   - DateImmigration1: Immigration date
+#'   - elo_rating_date: End date for analysis
+#'   - ImmigrationGp1: Group name
+#' @param affiliative Data frame with all observation days including:
+#'   - group_Abbreviation: Group name
+#'   - date: Observation date
+#' @param grooming_data Data frame with grooming observations including:
+#'   - group_Abbreviation: Group name
+#'   - date: Observation date
+#'   - idindividual1: First individual ID (groomer)
+#'   - idindividual2: Second individual ID (groomee)
+#' @param group_presence_matrices List of data frames with daily individual presence/absence:
+#'   - Date: date
+#'   - column names: individual code
+#'
+#' @return Data frame with network metrics for each immigrant
+
+calculate_groom_network_metrics <- function(potential_immig, affiliative, grooming_data, group_presence_matrices, end_date_col = "elo_rating_date_one_year_all") {
+  
+  # Validate end_date_col parameter
+  if (!end_date_col %in% names(potential_immig)) {
+    stop(paste("Column", end_date_col, "not found in potential_immig dataset"))
+  }
+  
+  # Clean presence matrices once - remove columns with NA or empty names
+  group_presence_matrices <- lapply(group_presence_matrices, function(mat) {
+    valid_cols <- !is.na(colnames(mat)) & colnames(mat) != "" & colnames(mat) != " "
+    mat <- mat[, valid_cols, drop = FALSE]
+    mat$Date <- as.Date(mat$Date)  # Convert dates once
+    return(mat)
+  })
+  
+  # Prepare potential_immig data
+  potential_immig$Code_lower <- tolower(as.character(potential_immig$Code))
+  potential_immig$DateImmigration1 <- as.Date(potential_immig$DateImmigration1)
+  potential_immig[[end_date_col]] <- as.Date(potential_immig[[end_date_col]])
+  
+  # Filter to valid individuals (have group in presence matrices and valid end date)
+  valid_individuals <- potential_immig %>%
+    filter(
+      ImmigrationGp1 %in% names(group_presence_matrices),
+      !is.na(.data[[end_date_col]])
+    )
+  
+  cat("Processing", nrow(valid_individuals), "individuals with valid data out of", nrow(potential_immig), "\n")
+  
+  # Prepare grooming data once
+  grooming_data$date <- as.Date(grooming_data$date)
+  grooming_data$idindividual1 <- tolower(as.character(grooming_data$idindividual1))
+  grooming_data$idindividual2 <- tolower(as.character(grooming_data$idindividual2))
+  grooming_data <- grooming_data[!is.na(grooming_data$idindividual1) &
+                                   !is.na(grooming_data$idindividual2) &
+                                  !is.na(grooming_data$date), ]
+  
+  # Prepare affiliative data once
+  affiliative$date <- as.Date(affiliative$date)
+  affiliative <- affiliative[!is.na(affiliative$date), ]
+  
+  # Initialize results list (faster than rbind in loop)
+  results_list <- vector("list", nrow(valid_individuals))
+  
+  # Process each valid individual
+  for (i in 1:nrow(valid_individuals)) {
+    
+    male_code <- valid_individuals$Code_lower[i]
+    group_name <- valid_individuals$ImmigrationGp1[i]
+    start_date <- valid_individuals$DateImmigration1[i]
+    end_date <- valid_individuals[[end_date_col]][i]
+    
+    # Get presence matrix for this group
+    presence_matrix <- group_presence_matrices[[group_name]]
+    
+    # Filter presence matrix for tenure period
+    presence_period <- presence_matrix[
+      presence_matrix$Date >= start_date & presence_matrix$Date <= end_date,
+    ]
+    
+    if (nrow(presence_period) == 0) {
+      message(paste("Individual", male_code, "has no presence data in tenure period"))
+      next
+    }
+    
+    # Calculate median group size (vectorized)
+    presence_data <- presence_period[, -1, drop = FALSE]  # Exclude Date column
+    daily_group_sizes <- rowSums(presence_data, na.rm = TRUE)
+    median_group_size <- median(daily_group_sizes, na.rm = TRUE)
+    
+    # Filter affiliative data for this group and time period
+    affiliative_period <- affiliative[
+      affiliative$group_Abbreviation == group_name &
+        affiliative$date >= start_date &
+        affiliative$date <= end_date,
+    ]
+    days_observed <- length(unique(affiliative_period$date))
+    
+    # Filter grooming data for this group and time period
+    group_data <- grooming_data[
+      grooming_data$group_Abbreviation == group_name &
+        grooming_data$date >= start_date &
+        grooming_data$date <= end_date,
+    ]
+    
+    # Calculate grooming metrics (vectorized comparisons)
+    focal_mask <- group_data$idindividual1 == male_code | group_data$idindividual2 == male_code
+    in_mask <- group_data$idindividual2 == male_code
+    out_mask <- group_data$idindividual1 == male_code
+    
+    total_grooming_days <- length(unique(group_data$date[focal_mask]))
+    in_grooming_days <- length(unique(group_data$date[in_mask]))
+    out_grooming_days <- length(unique(group_data$date[out_mask]))
+    
+    grooming_rate <- if(days_observed > 0) total_grooming_days / days_observed else 0
+    in_grooming_rate <- if(days_observed > 0) in_grooming_days / days_observed else 0
+    out_grooming_rate <- if(days_observed > 0) out_grooming_days / days_observed else 0
+    
+    # Network metrics
+    in_degree_normalized <- 0
+    out_degree_normalized <- 0
+    total_degree_normalized <- 0
+    eigenvector_centrality <- 0
+    
+    if (nrow(group_data) > 0) {
+      
+      # Create edge list with unique date counts per dyad
+      edge_list <- group_data %>%
+        group_by(idindividual1, idindividual2) %>%
+        summarise(weight = n_distinct(date), .groups = 'drop')
+      
+      # Create directed graph
+      g <- graph_from_data_frame(edge_list, directed = TRUE)
+      
+      # Check if focal individual is in the network
+      if (male_code %in% V(g)$name) {
+        
+        # Calculate degrees
+        in_deg <- igraph::degree(g, male_code, mode = "in")
+        out_deg <- igraph::degree(g, male_code, mode = "out")
+        
+        # Count unique partners
+        unique_partners <- length(unique(c(
+          igraph::neighbors(g, male_code, mode = "in"),
+          igraph::neighbors(g, male_code, mode = "out")
+        )))
+        
+        # Normalize by available partners
+        available_partners <- median_group_size - 1
+        if (available_partners > 0) {
+          in_degree_normalized <- in_deg / available_partners
+          out_degree_normalized <- out_deg / available_partners
+          total_degree_normalized <- unique_partners / available_partners
+        }
+        
+        # Calculate eigenvector centrality
+        tryCatch({
+          g_undirected <- as.undirected(g, mode = "collapse", edge.attr.comb = "sum")
+          eigen_cent <- eigen_centrality(g_undirected, directed = FALSE, weights = E(g_undirected)$weight)
+          
+          if (male_code %in% V(g_undirected)$name) {
+            eigenvector_centrality <- eigen_cent$vector[male_code]
+          }
+        }, error = function(e) {
+          message(paste("Error calculating eigenvector centrality for", male_code, ":", e$message))
+        })
+      }
+    }
+    
+    # Store results in list
+    results_list[[i]] <- data.frame(
+      immigrant_code = male_code,
+      group = group_name,
+      grooming_rate = grooming_rate,
+      in_grooming_rate = in_grooming_rate,
+      out_grooming_rate = out_grooming_rate,
+      in_degree_normalized = in_degree_normalized,
+      out_degree_normalized = out_degree_normalized,
+      total_degree_normalized = total_degree_normalized,
+      eigenvector_centrality = eigenvector_centrality,
+      total_grooming_days = total_grooming_days,
+      in_grooming_days = in_grooming_days,
+      out_grooming_days = out_grooming_days,
+      days_observed = days_observed,
+      median_group_size = median_group_size,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  # Combine all results at once (much faster than rbind in loop)
+  results <- bind_rows(results_list)
+  
+  # Add back individuals who were filtered out with NA values
+  all_individuals <- data.frame(
+    immigrant_code = potential_immig$Code_lower,
+    stringsAsFactors = FALSE
+  )
+  
+  results <- all_individuals %>%
+    left_join(results, by = "immigrant_code")
+  
+  return(results)
+}
+```
+
+## Compare Time Windows
+
+Compare metrics calculated with slightly different time windows (from immigration date until the elo rating calculation with all conflicts or until the elo rating calculations with only male-male conflicts).
+
+```{r}
+# Calculate with "all conflicts" end date
+network_metrics_all <- calculate_groom_network_metrics(
+  potential_immig = potential_immig,
+  affiliative = affiliative,
+  grooming_data = grooming_data,
+  group_presence_matrices = group_presence_matrices,
+  end_date_col = "elo_rating_date_one_year_all")
+
+# Calculate with "male-male" end date
+network_metrics_male_male <- calculate_groom_network_metrics(
+  potential_immig = potential_immig,
+  affiliative = affiliative,
+  grooming_data = grooming_data,
+  group_presence_matrices = group_presence_matrices,
+  end_date_col = "elo_rating_date_one_year_male_male")
+
+# Create temporary merge just for correlation analysis
+temp_combined <- network_metrics_all %>%
+  select(-group) %>%
+  left_join(
+    network_metrics_male_male %>% select(-group),
+    by = "immigrant_code",
+    suffix = c("_all", "_male_male")
+  )
+
+# Check correlations
+metrics_to_compare <- c("grooming_rate", "in_grooming_rate", "out_grooming_rate",
+                        "in_degree_normalized", "out_degree_normalized", 
+                        "total_degree_normalized", "eigenvector_centrality")
+
+cat("\n=== CORRELATIONS BETWEEN ALL vs MALE-MALE WINDOWS ===\n")
+correlation_results <- data.frame(
+  metric = character(),
+  correlation = numeric(),
+  stringsAsFactors = FALSE)
+
+for(metric in metrics_to_compare) {
+  col_all <- paste0(metric, "_all")
+  col_male_male <- paste0(metric, "_male_male")
+  
+  correlation <- cor(temp_combined[[col_all]], 
+                     temp_combined[[col_male_male]], 
+                     use = "complete.obs")
+  
+  correlation_results <- rbind(correlation_results,
+                               data.frame(metric = metric, correlation = correlation))
+  
+  cat(sprintf("%-30s r = %.3f\n", metric, correlation))
+}
+
+# Summary
+mean_correlation <- mean(correlation_results$correlation, na.rm = TRUE)
+cat("\n=== SUMMARY ===\n")
+cat(sprintf("Mean correlation across all metrics: r = %.3f\n", mean_correlation))
+```
+
+Given the extremely high correlation, we will only save the network metrics calculated from the immigration date until the elo rating calculation using all conflicts.
+
+# Add Demographic Data and Save
+
+```{r}
+add_immigration_data <- function(network_metrics_all, potential_immig) {
+  enhanced_metrics <- network_metrics_all %>%
+    left_join(potential_immig, by = c("immigrant_code" = "Code"))
+  
+  return(enhanced_metrics)
+}
+
+network_output_groom <- add_immigration_data(network_metrics_all, potential_immig)
+
+write.csv(network_output_groom, file="/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/network_output_groom.csv")
+```
+
+---
+
+**Analysis completed:** `r Sys.Date()`
