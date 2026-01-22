@@ -1,0 +1,838 @@
+---
+title: "Social Behavior and Tenure Analysis"
+author: "Alba Motes Rodrigo"
+date: "2025-11-07"
+output: 
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  error = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+<style>
+h1 {
+  font-size: 32px;
+  font-weight: bold;
+}
+
+h2 {
+  font-size: 26px;
+  font-weight: bold;
+}
+
+h3 {
+  font-size: 22px;
+  font-weight: bold;
+}
+</style>
+
+# Does social integration predict tenure?
+
+For this analyses we can use all emmigrants (not just those for which we have elo ratings or maternal elo ratings)
+
+```{r}
+library(dplyr)
+library(glmmTMB)
+library(ggplot2)
+library(cowplot)
+library(lubridate)
+library(tidyr)
+library(igraph)
+library(purrr)
+library(emmeans)
+library(ggeffects)
+
+#load group presence matrices
+load("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/Immigrants_environment.RData")
+
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Analyses/dharma_diagnostic_fnct.R")
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Analyses/extract_scans_fnct.R")
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Analyses/proximity_network_metrics_calculator_fnct.R")
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Analyses/grooming_network_metrics_calculator_fnct.R")
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Analyses/median_group_size_calculator.R")
+
+potential_immig<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/All_potential_immigrants.csv")
+
+beh_tenure_dataset<-subset(potential_immig, Tenure>60)#I use 60 or otherwise they won't have enough social data
+
+affiliative<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Diffusion_vervets/IVP_data/adlib/affiliative.csv")
+
+grooming_data<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/grooming_data2010_2025.csv")
+
+#change group names
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK", "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing"="CR", "IFamily"="IF")
+
+# Create a new column with abbreviate group names
+affiliative <- affiliative %>%
+mutate(    
+group_Abbreviation = group_abbreviations[group])  # Abbreviate group names
+
+grooming_data<-grooming_data%>%
+mutate(    
+group_Abbreviation = group_abbreviations[group])
+
+#remove rows without group
+affiliative<-affiliative[affiliative$group!="",]
+affiliative$date <- as.Date(affiliative$date)
+```
+
+# GROOMING metrics for emigrants
+
+I use a variation of the function calculate_network_metrics from the affiliative_data_rank_analyses script.
+
+```{r}
+#' Calculate Network Metrics for Immigrant Males
+#'
+#' @param potential_immig Data frame with immigrant information including:
+#'   - Code: Individual ID
+#'   - DateImmigration1: Immigration date
+#'   - end_date_col: End date for analysis
+#'   - ImmigrationGp1: Group name
+#' @param affiliative Data frame with all observation days including:
+#'   - group_Abbreviation: Group name
+#'   - date: Observation date
+#' @param grooming_data Data frame with grooming observations including:
+#'   - group_Abbreviation: Group name
+#'   - date: Observation date
+#'   - idindividual1: First individual ID (groomer)
+#'   - idindividual2: Second individual ID (groomee)
+#' @param group_sizes Data frame with group size information including:
+#'   - immigrant_code: Individual ID
+#'   - group: Group name
+#'   - median_group_size: Median group size
+#'   - days_observed: Total days observed
+#'   - DateImmigration1: Immigration date
+#'   - end_date_col: End date
+#'
+#' @return Data frame with network metrics for each immigrant
+
+network_metrics_emigrants_grooming<-calculate_groom_network_metrics(beh_tenure_dataset, affiliative, grooming_data, group_presence_matrices, end_date_col = "LastSeen1")
+
+#remove those individuals from groups that were observed less than 10 days overall and add tenure
+network_metrics_emigrants_grooming <- network_metrics_emigrants_grooming %>%
+  filter(total_grooming_days >= 10) %>%
+  left_join(beh_tenure_dataset %>% select(Code, Tenure), 
+            by = c("immigrant_code" = "Code"))
+```
+
+## Models using all individuals that emigrated
+
+Using individuals that emigrated and that have at least 10 scans, were observed for at least 10 ad lib days and stayed in the group at least 60 days
+
+```{r}
+library(glmmTMB)
+
+#grooming data
+model_groom_tenure16 <- glmmTMB(Tenure ~ grooming_rate*group+eigenvector_centrality*group, data = network_metrics_emigrants_grooming,
+family = nbinom2)
+#interaction not significant
+
+table(network_metrics_emigrants_grooming$group)
+
+#This function is also from the Analyses_socbehav_matrank.Rmd
+dharma_results2 <- check_lmer_assumptions_dharma(model_groom_tenure16, "Tenure")
+
+model_groom_tenure_null16 <- glmmTMB(Tenure ~ 1 , data = network_metrics_emigrants_grooming, family = nbinom2)
+
+library(performance)
+anova(model_groom_tenure16,model_groom_tenure_null16, test="Chisq")
+
+drop1(model_groom_tenure16, test = "Chisq")
+#no significant interactions of centrality and group but yes of grooming rate and group but this seems to be driven by the unhabituated groups so I am gonna rerun deleting them.
+
+summary(model_groom_tenure16)
+```
+
+## Rerun model with the most habituated groups
+
+```{r}
+# Filter out CR and LT groups
+network_metrics_emigrants_grooming_filtered <- network_metrics_emigrants_grooming %>%
+  filter(!group %in% c("CR", "LT"))
+
+# Check the remaining groups
+table(network_metrics_emigrants_grooming_filtered$group)
+
+# Run the model with interactions
+model_groom_tenure16_filt <- glmmTMB(Tenure ~ grooming_rate*group + eigenvector_centrality*group,
+data = network_metrics_emigrants_grooming_filtered,
+                                 family = nbinom2)
+
+AIC(model_groom_tenure16_filt, model_groom_tenure16)
+
+# Check assumptions with DHARMa
+dharma_results2 <- check_lmer_assumptions_dharma(model_groom_tenure16_filt, "Tenure")
+
+# Null model
+model_groom_tenure16_filt_null <- glmmTMB(Tenure ~ 1,
+data = network_metrics_emigrants_grooming_filtered,
+                                 family = nbinom2)
+
+# Model comparison
+anova(model_groom_tenure16_filt, model_groom_tenure16_filt_null)
+
+# Test individual terms
+drop1(model_groom_tenure16_filt, test = "Chisq")
+#the interactions are not significant
+
+#rerun without interaction
+model_groom_tenure16_filt <- glmmTMB(Tenure ~ grooming_rate+group+ eigenvector_centrality,
+data = network_metrics_emigrants_grooming_filtered,
+                                 family = nbinom2)
+
+dharma_results2 <- check_lmer_assumptions_dharma(model_groom_tenure16_filt, "Tenure")
+
+model_groom_tenure16_filt_null <- glmmTMB(Tenure ~ 1,
+data = network_metrics_emigrants_grooming_filtered,
+                                 family = nbinom2)
+
+anova(model_groom_tenure16_filt, model_groom_tenure16_filt_null)
+
+drop1(model_groom_tenure16_filt, test="Chisq")
+
+summary(model_groom_tenure16_filt)
+#grooming rate is the only one with an effect on tenure
+```
+
+# PROXIMITY
+
+## Extract scan data emigrants
+
+```{r}
+scans<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Diffusion_vervets/IVP_data/scans/scanswithid_ivp_1and2m.csv")
+
+scans <- scans %>%
+mutate(    
+group_Abbreviation = group_abbreviations[group])  # Abbreviate group names
+
+scans <- scans %>% mutate(idindividual1 = tolower(idindividual1), ind1m = tolower(ind1m), ind2m = tolower(ind2m), nnadult = tolower(nnadult), nnjuvenile = tolower(nnjuvenile))
+```
+
+This function is from the proximity_data_rank_analyses markdown
+
+```{r}
+scan_list_all_emigrants <- extract_male_scan_interactions(scans, beh_tenure_dataset, end_date_col = "LastSeen1")
+```
+
+Calculate proximity network metrics. This function is also from the proximity_data_rank_analyses markdown
+
+```{r}
+network_metrics_all_emigrants_proximity <- calculate_proximity_network_metrics(scan_list_all_emigrants, beh_tenure_dataset)
+
+unique(network_metrics_all_emigrants_proximity$immigrant_code)
+
+#keep only those that appear in at least 10 scans and add tenure
+network_metrics_all_emigrants_proximity <- network_metrics_all_emigrants_proximity %>%
+  filter(total_scans >= 10) %>%
+  left_join(beh_tenure_dataset %>% select(Code, Tenure), 
+            by = c("immigrant_code" = "Code"))
+
+#add normalized degree by dividing by group size. These functions are from the Analyses_socbehav_matrank.Rmd
+group_sizes_emigrants<-calculate_median_group_size(beh_tenure_dataset, group_presence_matrices, end_date_col = "LastSeen1")
+
+# Function to add normalized degree column to network metrics
+add_normalized_degree <- function(network_metrics, group_size_data,
+                                  median_col = "median_group_size_all",
+                                  output_col = "degree_normalized_all") {
+  
+  # Check if the median column exists in group_size_data
+  if (!median_col %in% colnames(group_size_data)) {
+    stop(paste("Column", median_col, "not found in group_size_data. Available columns:", 
+              paste(colnames(group_size_data), collapse = ", ")))
+  }
+  
+  # Merge network metrics with group size data
+  network_metrics_normalized <- network_metrics %>%
+    left_join(group_size_data %>% select(immigrant_code, !!sym(median_col)), 
+              by = "immigrant_code") %>%
+    mutate(
+      # Create normalized degree using the specified median column
+      !!output_col := ifelse(!is.na(!!sym(median_col)) & !!sym(median_col) > 0,
+                             degree / !!sym(median_col),
+                             NA)
+    ) %>%
+    select(-!!sym(median_col))  # Remove the temporary median column
+  
+  # Check for any missing group size data
+  missing_group_size <- network_metrics_normalized %>%
+    filter(is.na(!!sym(output_col))) %>%
+    select(immigrant_code, group)
+  
+  if (nrow(missing_group_size) > 0) {
+    warning("Missing or zero group size data for the following immigrants:")
+    print(missing_group_size)
+  }
+  
+  return(network_metrics_normalized)
+}
+
+# Then normalize the network metrics
+network_metrics_all_emigrants_proximity <- add_normalized_degree(network_metrics_all_emigrants_proximity, group_sizes_emigrants, median_col = "median_group_size",
+output_col = "degree_normalized")
+```
+
+## Proximity scan data models
+
+```{r}
+#proximity scan data
+model_scan_tenure17 <- glmmTMB(Tenure ~ strength_assoc*group+eigenvector_centrality*group, data = network_metrics_all_emigrants_proximity, family= nbinom2)
+
+unique(network_metrics_all_emigrants_proximity$group)
+
+dharma_results2 <- check_lmer_assumptions_dharma(model_scan_tenure17, "Tenure")
+
+model_scan_tenure_null17 <- glmmTMB(Tenure ~ 1 , data = network_metrics_all_emigrants_proximity, family= nbinom2)
+
+anova(model_scan_tenure17, model_scan_tenure_null17, test="Chisq")
+
+summary(model_scan_tenure17)
+
+drop1(model_scan_tenure17, test="Chisq")
+#stregth of association is significant
+
+#rerun with habituated groups
+# Filter out CR and LT groups
+network_metrics_all_emigrants_proximity_filtered <- network_metrics_all_emigrants_proximity %>%
+  filter(!group %in% c("CR", "LT"))
+
+# Check remaining groups
+unique(network_metrics_all_emigrants_proximity_filtered$group)
+table(network_metrics_all_emigrants_proximity_filtered$group)
+
+# Run the model
+model_scan_tenure17_filt <- glmmTMB(Tenure ~ strength_assoc*group + eigenvector_centrality*group, data = network_metrics_all_emigrants_proximity_filtered,
+                                 family = nbinom2)
+
+# Check assumptions with DHARMa
+dharma_results2 <- check_lmer_assumptions_dharma(model_scan_tenure17_filt, "Tenure")
+
+# Null model
+model_scan_tenure_filt_null17 <- glmmTMB(Tenure ~ 1,
+data = network_metrics_all_emigrants_proximity_filtered, family = nbinom2)
+
+# Model comparison
+anova(model_scan_tenure17_filt, model_scan_tenure_filt_null17, test = "Chisq")
+
+# Model summary
+summary(model_scan_tenure17_filt)
+#same result
+
+drop1(model_scan_tenure17_filt, test = "Chisq")
+```
+
+### Pairwise group comparisons
+
+```{r}
+library(emmeans)
+
+# For strength_assoc:group interaction
+emm_assoc <- emtrends(model_scan_tenure17_filt, 
+                      pairwise ~ group, 
+                      var = "strength_assoc")
+summary(emm_assoc$contrasts)
+
+# For eigenvector_centrality:group interaction
+emm_eigen <- emtrends(model_scan_tenure17_filt, 
+                      pairwise ~ group, 
+                      var = "eigenvector_centrality")
+summary(emm_eigen$contrasts)
+
+car::Anova(model_scan_tenure17_filt, type = "III")
+
+# Get mean association strength by group
+network_metrics_all_emigrants_proximity_filtered %>%
+  group_by(group) %>%
+  summarise(
+    mean_assoc = mean(strength_assoc, na.rm = TRUE),
+    sd_assoc = sd(strength_assoc, na.rm = TRUE),
+    n = n()
+  )
+```
+
+In AK, males with higher association strength have much longer tenures. In BD, this relationship is much weaker - association strength doesn't predict tenure as strongly. But the groups don't differ much in average association strength.
+
+## Test with equal duration
+
+### PROXIMITY
+
+```{r}
+# filter scan_list to only include scans from first 200 days
+scan_list_early <- lapply(names(scan_list_all_emigrants), function(immig_code) {
+  
+  # Get immigration date for this immigrant and convert to Date
+  immig_date <- beh_tenure_dataset$DateImmigration1[beh_tenure_dataset$Code == immig_code]
+  
+  if (length(immig_date) == 0) return(NULL)  # No match found
+  
+  immig_date <- as.Date(immig_date)  # Convert to Date
+  end_200 <- immig_date + 200
+  
+  # Filter scans
+  scan_data <- scan_list_all_emigrants[[immig_code]]
+  if (!is.null(scan_data) && nrow(scan_data) > 0) {
+    scan_data_early <- scan_data %>%
+      filter(date >= immig_date & date < end_200)
+    return(scan_data_early)
+  } else {
+    return(NULL)
+  }
+})
+
+names(scan_list_early) <- names(scan_list_all_emigrants)
+
+# Calculate network metrics using the filtered data
+network_metrics_early_proximity <- calculate_proximity_network_metrics(
+  scan_list_early, 
+  beh_tenure_dataset)
+
+#add tenure
+network_metrics_early_proximity <- network_metrics_early_proximity %>%
+  left_join(
+    beh_tenure_dataset %>% 
+      mutate(Code = tolower(Code)) %>%
+      select(Code, Tenure),
+    by = c("immigrant_code" = "Code")
+  )
+
+network_metrics_early_proximity <- add_normalized_degree(network_metrics_early_proximity, group_sizes_emigrants, median_col = "median_group_size")
+
+network_metrics_early_proximity<-subset(network_metrics_early_proximity, total_scans>=10)
+```
+
+Only 36 individuals have at least 10 scans during the first 200 days of tenure. If I use less days, very few individuals have enough scans to be included in the analyses.
+
+```{r}
+model_scan_tenure_early <- glmmTMB(Tenure ~ degree_normalized_all + +strength_assoc+group+eigenvector_centrality, data = network_metrics_early_proximity, family= nbinom2)
+
+model_scan_tenure_early_null <- glmmTMB(Tenure ~1, data = network_metrics_early_proximity, family= nbinom2)
+
+#group is tested for because based on the literature the demographics of the group affect tenure in a variety of species
+anova(model_scan_tenure_early,model_scan_tenure_early_null)
+#no early effects
+
+summary(model_scan_tenure_early)
+
+drop1(model_scan_tenure_early, test="Chisq")
+#no effects
+```
+
+no effects early on
+
+### GROOMING
+
+```{r}
+# Create early period dataset
+emigrants_early <- beh_tenure_dataset %>%
+  mutate(
+    early_end_date = as.Date(DateImmigration1) + 200
+  )
+
+# Calculate grooming metrics for first 200 days
+network_metrics_early_grooming <- calculate_groom_network_metrics(
+  potential_immig = emigrants_early,
+  affiliative = affiliative,
+  grooming_data = grooming_data,
+  group_presence_matrices = group_presence_matrices,
+  end_date_col = "early_end_date"  # Use the new column
+)
+
+network_metrics_early_grooming <- network_metrics_early_grooming %>%
+  filter(days_observed >= 10) %>%
+  left_join(beh_tenure_dataset %>% select(Code, Tenure), 
+            by = c("immigrant_code" = "Code"))
+
+nrow(network_metrics_early_grooming)
+```
+
+139 individuals were observed at least 10 days.
+
+```{r}
+model_groom_tenure_early <- glmmTMB(Tenure ~ total_degree_normalized  + grooming_rate+eigenvector_centrality + group, data = network_metrics_early_grooming,
+family = nbinom2)
+
+model_groom_tenure_early_null <- glmmTMB(Tenure ~ 1, data = network_metrics_early_grooming,
+family = nbinom2)
+
+check_lmer_assumptions_dharma(model_groom_tenure_early)
+
+anova(model_groom_tenure_early,model_groom_tenure_early_null )
+#not significant
+
+drop1(model_groom_tenure_early, test="Chisq")
+#no effects
+```
+
+# PLOTS
+
+## Plot association strength and tenure by group
+
+```{r}
+all_groups <- c("AK", "BD", "CR", "IF", "KB", "LT", "NH")
+
+group_colors <- c(
+  "AK" = "#00CC99",
+  "BD" = "#1F78B4", 
+  "CR" = "#7570B3",
+  "IF" = "#660000",
+  "KB" = "#336633",
+  "LT" = "#E6AB02",
+  "NH" = "#FF6600"
+)
+
+library(ggplot2)
+library(dplyr)
+
+# Get max tenure observed
+max_tenure <- max(network_metrics_all_emigrants_proximity$Tenure, na.rm = TRUE)
+
+# Get predictions for all groups
+pred_all <- ggpredict(model_scan_tenure17_filt, 
+                      terms = c("strength_assoc [all]", "group"))
+
+# Convert to data frame and filter out extreme predictions
+pred_all_filtered <- as.data.frame(pred_all) %>%
+  filter(predicted <= max_tenure * 1.5,  # Only keep predictions within 150% of max observed
+         conf.high <= max_tenure * 2)     # And reasonable confidence intervals
+
+# Count per group
+group_counts <- network_metrics_all_emigrants_proximity %>%
+  group_by(group) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(group, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$group)
+
+# Plot
+assoc_prox_tenure_plot <- ggplot() +
+  geom_ribbon(data = pred_all_filtered,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              alpha = 0.2) +
+  geom_line(data = pred_all_filtered,
+            aes(x = x, y = predicted, color = group),
+            linewidth = 1.5, show.legend = FALSE) +
+  geom_point(data = network_metrics_all_emigrants_proximity,
+             aes(x = strength_assoc, y = Tenure, color = group),
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = group_colors, labels = group_labels) +
+  scale_fill_manual(values = group_colors, labels = group_labels) +
+  coord_cartesian(ylim = c(0, max_tenure * 1.1)) +  # Set y-axis limits explicitly
+  labs(x = "Association Rate*** (Full term)",
+       y = "Tenure (Days)",
+       color = NULL,
+       fill = NULL) +
+  theme_classic(base_size = 14) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(linetype = 0)),
+fill = "none") +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.box = "horizontal",
+        legend.justification = "center", 
+        legend.spacing.y = unit(-0.1, "cm"),
+        legend.text = element_text(size = 8),  
+        legend.key.size = unit(0.4, "cm")) +
+  annotate("text", x = -Inf, y = Inf, label = "F", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+
+print(assoc_prox_tenure_plot)
+``` 
+
+## Plot eigenvector and tenure by group
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Get max tenure observed
+max_tenure <- max(network_metrics_all_emigrants_proximity$Tenure, na.rm = TRUE)
+
+# Get predictions for all groups
+pred_all <- ggpredict(model_scan_tenure17_filt, 
+                      terms = c("eigenvector_centrality [all]", "group"))
+
+# Convert to data frame and filter out extreme predictions
+pred_all_filtered <- as.data.frame(pred_all) %>%
+  filter(predicted <= max_tenure * 1.5,  # Only keep predictions within 150% of max observed
+         conf.high <= max_tenure * 2)     # And reasonable confidence intervals
+
+# Count per group
+group_counts <- network_metrics_all_emigrants_proximity %>%
+  group_by(group) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(group, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$group)
+
+# Plot
+eigen_prox_tenure_plot <- ggplot() +
+  geom_ribbon(data = pred_all_filtered,
+              aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+              alpha = 0.2) +
+  geom_line(data = pred_all_filtered,
+          aes(x = x, y = predicted, color = group),
+          linewidth = 1.5, show.legend = FALSE) +
+  geom_point(data = network_metrics_all_emigrants_proximity,
+             aes(x = eigenvector_centrality, y = Tenure, color = group),
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = group_colors, labels = group_labels) +
+  scale_fill_manual(values = group_colors, labels = group_labels) +
+  coord_cartesian(ylim = c(0, max_tenure * 1.1)) +  # Set y-axis limits explicitly
+  labs(x = "Eigenvector Centrality* (Full term)",
+       y = "Tenure (Days)",
+       color = NULL,
+       fill = NULL) +
+  theme_classic(base_size = 14) + 
+guides(color = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(linetype = 0)), fill = "none")+
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.box = "horizontal",
+        legend.justification = "center", 
+        legend.spacing.y = unit(-0.1, "cm"),
+        legend.text = element_text(size = 8),  
+        legend.key.size = unit(0.4, "cm")) +
+  annotate("text", x = -Inf, y = Inf, label = "E", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+
+print(eigen_prox_tenure_plot)
+```
+
+## Plot grooming rate and tenure by group
+
+```{r}
+library(ggplot2)
+
+# Get predictions ignoring group (marginal effect)
+pred_overall <- ggpredict(model_groom_tenure16_filt, 
+                          terms = "grooming_rate [all]")
+
+# Count per group
+group_counts <- network_metrics_emigrants_grooming %>%
+  group_by(group) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(group, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$group)
+
+# Plot - overall line (black) + points by group
+rate_groom_tenure_plot <- ggplot() +
+  # Overall line and ribbon (black with light grey)
+  geom_ribbon(data = as.data.frame(pred_overall),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = as.data.frame(pred_overall),
+            aes(x = x, y = predicted),
+            color = "black", linewidth = 1.5) +
+  # All data points colored by group
+  geom_point(data = network_metrics_emigrants_grooming,
+             aes(x = grooming_rate, y = Tenure, color = group),
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = group_colors, labels = group_labels) +
+  coord_cartesian(ylim = c(0, 2500)) +  # Limit predictions to 2500 days
+  labs(x = "Grooming Rate* (Full Term)",
+       y = "Tenure (Days)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  guides(color = guide_legend(nrow = 3, byrow = TRUE)) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.text = element_text(size = 8),
+        legend.spacing.y = unit(-0.1, "cm"),
+        legend.key.size = unit(0.4, "cm"))+ 
+annotate("text", x = -Inf, y = Inf, label = "C", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+
+print(rate_groom_tenure_plot)
+```
+
+## Plot eigenvector grooming and tenure by group
+
+```{r}
+library(ggplot2)
+
+# Get predictions ignoring group (marginal effect), up to 2500 days
+pred_overall <- ggpredict(model_groom_tenure16_filt, 
+                          terms = "eigenvector_centrality [0:1 by=0.05]")
+
+# Count per group
+group_counts <- network_metrics_emigrants_grooming_filtered %>%
+  group_by(group) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(group, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$group)
+
+# Plot - overall line (black) + points by group
+eigen_groom_tenure_plot <- ggplot() +
+  # Overall line and ribbon (black with light grey)
+  geom_ribbon(data = as.data.frame(pred_overall),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = as.data.frame(pred_overall),
+            aes(x = x, y = predicted),
+            color = "black", linewidth = 1.5) +
+  # All data points colored by group
+  geom_point(data = network_metrics_emigrants_grooming_filtered,
+             aes(x = eigenvector_centrality, y = Tenure, color = group),
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = group_colors, labels = group_labels) +
+  coord_cartesian(ylim = c(0, 2500)) +  # Limit predictions to 2500 days
+  labs(x = "Eigenvector Centrality (Full Term)",
+       y = "Tenure (Days)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.box = "horizontal",
+        legend.justification = "center", 
+        legend.spacing.y = unit(-0.1, "cm"),
+        legend.text = element_text(size = 8),  
+        legend.key.size = unit(0.4, "cm")) + 
+annotate("text", x = -Inf, y = Inf, label = "B", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+
+print(eigen_groom_tenure_plot)
+```
+
+## Early period plots
+
+```{r}
+library(ggeffects)
+library(ggplot2)
+
+# Get predictions for strength_assoc
+pred_strength <- ggpredict(model_scan_tenure_early, 
+                          terms = "strength_assoc [all]")
+
+# Count per group
+group_counts <- network_metrics_early_proximity %>%
+  group_by(group) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(group, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$group)
+
+# Plot - points colored by group + overall strength line
+assoc_prox_200<-ggplot() +
+  # Overall strength association line and ribbon
+  geom_ribbon(data = as.data.frame(pred_strength),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = as.data.frame(pred_strength),
+            aes(x = x, y = predicted),
+            color = "black", linewidth = 1.5)+
+  # All data points colored by group
+  geom_point(data = network_metrics_early_proximity,
+             aes(x = strength_assoc, y = Tenure, color = group),
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = group_colors, labels = group_labels) +
+  labs(x =  "Association Rate (200 Days)",
+       y = "Tenure (Days)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.box = "horizontal",
+        legend.justification = "center", 
+        legend.spacing.y = unit(-0.1, "cm"), 
+        legend.text = element_text(size = 8),  
+        legend.key.size = unit(0.4, "cm"))+
+  annotate("text", x = -Inf, y = Inf, label = "D", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+```
+
+```{r}
+library(ggeffects)
+library(ggplot2)
+
+# Get predictions for grooming rate
+pred_rate <- ggpredict(model_groom_tenure_early, 
+                       terms = "grooming_rate [all]")
+
+# Count per group
+group_counts <- network_metrics_early_grooming %>%
+  group_by(group) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(group, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$group)
+
+# Plot - points colored by group + overall rate line
+rate_groom_200 <- ggplot() +
+  # Overall rate association line and ribbon
+  geom_ribbon(data = as.data.frame(pred_rate),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = as.data.frame(pred_rate),
+            aes(x = x, y = predicted),
+            color = "black", linewidth = 1.5)+
+  # All data points colored by group
+  geom_point(data = network_metrics_early_grooming,
+             aes(x = grooming_rate, y = Tenure, color = group),
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = group_colors, labels = group_labels) +
+  coord_cartesian(ylim = c(0, 2500)) +  # Limit predictions to 2500 days
+  labs(x = "Grooming Rate (200 Days)",
+       y = "Tenure (Days)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  guides(color = guide_legend(nrow = 3, byrow = TRUE)) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.text = element_text(size = 8),        
+        legend.key.size = unit(0.4, "cm"),
+        legend.spacing.y = unit(-0.1, "cm")) +
+  annotate("text", x = -Inf, y = Inf, label = "A", 
+           hjust = -0.5, vjust = 1.5, size = 4, fontface = "bold")
+
+print(rate_groom_200)
+```
+
+## Combined plot: relationship between social behaviour and tenure
+
+```{r}
+library(grid)
+
+grid.newpage()
+pushViewport(viewport(layout = grid.layout(4, 3,
+                                           heights = unit(c(0.8, 5, 0.5, 5), c("lines", "null", "lines", "null")),
+                                           widths = unit(c(5, 5, 5), c("null", "null", "null")))))
+
+# Add row labels
+grid.text("Grooming", vp = viewport(layout.pos.row = 2, layout.pos.col = 1:3),
+          gp = gpar(fontsize = 18, fontface = "bold"), y = unit(1, "npc") - unit(0.5, "lines"))
+
+grid.text("Proximity", vp = viewport(layout.pos.row = 4, layout.pos.col = 1:3),
+          gp = gpar(fontsize = 18, fontface = "bold"), y = unit(1, "npc") - unit(0.5, "lines"))
+
+# Add plots - top row
+print(rate_groom_200, vp = viewport(layout.pos.row = 2, layout.pos.col = 1))
+print(eigen_groom_tenure_plot, vp = viewport(layout.pos.row = 2, layout.pos.col = 2))
+print(rate_groom_tenure_plot, vp = viewport(layout.pos.row = 2, layout.pos.col = 3))
+
+# Bottom row
+print(assoc_prox_200, vp = viewport(layout.pos.row = 4, layout.pos.col = 1))
+print(eigen_prox_tenure_plot, vp = viewport(layout.pos.row = 4, layout.pos.col = 2))
+print(assoc_prox_tenure_plot, vp = viewport(layout.pos.row = 4, layout.pos.col = 3))
+
+# Row labels
+grid.text("Grooming", x = 0.55, y = 0.98, gp = gpar(fontsize = 16, fontface = "bold"))
+grid.text("Proximity", x = 0.55, y = 0.48, gp = gpar(fontsize = 16, fontface = "bold"))
+```

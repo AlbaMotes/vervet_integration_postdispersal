@@ -1,0 +1,1472 @@
+---
+title: "Maternal Rank and Male Social Integration Analysis"
+author: "Alba Motes Rodrigo"
+date: "2025-06-27"
+output: 
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  error = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+<style>
+h1 {
+  font-size: 32px;
+  font-weight: bold;
+}
+
+h2 {
+  font-size: 26px;
+  font-weight: bold;
+}
+
+h3 {
+  font-size: 22px;
+  font-weight: bold;
+}
+</style>
+
+# Overview
+
+There was a discussion that LT (1 in scan one in groom) and CR (one in groom) data is not as reliable as from the other groups. Their removal did not change the results.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(lubridate)
+library(cowplot)
+library(glmmTMB)
+
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Analyses/dharma_diagnostic_fnct.R")
+
+xdata_groom<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/network_output_groom.csv")
+
+xdata_scan<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/network_metrics_prox_male_female.csv")
+
+load("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/Immigrants_environment.RData")
+
+potential_immig<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/All_potential_immigrants.csv")
+
+potential_immig <- potential_immig %>%
+  mutate(year_immig = lubridate::year(as.Date(DateImmigration1)))
+
+xdata_groom<- xdata_groom %>%
+  mutate(year_immig = lubridate::year(as.Date(DateImmigration1)))
+```
+
+# Prepare Normalized Degree in Scan Data
+
+## Standardize degree calculated from proximity data based on group size
+
+```{r}
+calculate_median_group_size <- function(potential_immig, group_presence_matrices, end_date_col = "elo_rating_date_one_year_all") {
+  
+  # Validate end_date_col parameter - check if column exists in the dataframe
+  if (!end_date_col %in% colnames(potential_immig)) {
+    stop(paste("Column", end_date_col, "not found in potential_immig. Available columns:", 
+              paste(colnames(potential_immig), collapse = ", ")))
+  }
+  
+  # Initialize results dataframe
+  group_size_results <- data.frame(
+    immigrant_code = character(),
+    group = character(),
+    median_group_size = numeric(),
+    min_group_size = numeric(),
+    max_group_size = numeric(),
+    days_observed = numeric(),
+    DateImmigration1 = as.Date(character()),
+    end_date = as.Date(character()),
+    end_date_type = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each immigrant
+  for (i in 1:nrow(potential_immig)) {
+    immigrant_code <- potential_immig$Code[i]
+    group_abbreviation <- potential_immig$ImmigrationGp1[i]
+    start_date <- potential_immig$DateImmigration1[i]
+    end_date <- potential_immig[[end_date_col]][i]
+    
+    # Skip if any required data is missing
+    if (is.na(immigrant_code) || is.na(group_abbreviation) || is.na(start_date) || is.na(end_date)) {
+      warning(paste("Skipping immigrant", immigrant_code, "due to missing data"))
+      next
+    }
+    
+    # Ensure dates are in Date format
+    start_date <- as.Date(start_date)
+    end_date <- as.Date(end_date)
+    
+    # Check if end_date is after start_date
+    if (end_date <= start_date) {
+      warning(paste("Skipping immigrant", immigrant_code, "- end date is not after DateImmigration1"))
+      next
+    }
+    
+    # Get the presence matrix for this group using the abbreviation
+    presence_matrix <- group_presence_matrices[[group_abbreviation]]
+    if (is.null(presence_matrix)) {
+      warning(paste("No presence matrix found for group", group_abbreviation, "for immigrant", immigrant_code))
+      cat("Available group matrices:", paste(names(group_presence_matrices), collapse = ", "), "\n")
+      next
+    }
+    
+    # Convert row names (dates) to Date format if they aren't already
+    matrix_dates <- as.Date(presence_matrix$Date)
+    
+    # Find rows (dates) within the period
+    period_rows <- which(matrix_dates >= start_date & matrix_dates <= end_date)
+    
+    if (length(period_rows) == 0) {
+      warning(paste("No presence data found for the period for immigrant", immigrant_code))
+      next
+    }
+    
+    # Extract the subset of the presence matrix for the relevant period
+    period_matrix <- presence_matrix[period_rows, -1, drop = FALSE]  # Exclude Date column
+    
+    # Calculate group size for each day (count individuals present = 1, excluding the immigrant if present)
+    daily_group_sizes <- c()
+    
+    for (row_idx in 1:nrow(period_matrix)) {
+      total_present <- sum(period_matrix[row_idx, ] == 1, na.rm = TRUE)
+      
+      # Check if the immigrant is in the matrix and was present on this day
+      immigrant_code_lower <- tolower(immigrant_code)
+      immigrant_cols <- which(tolower(colnames(period_matrix)) == immigrant_code_lower)
+      
+      if (length(immigrant_cols) > 0) {
+        # If immigrant is in the matrix, subtract 1 if they were present
+        immigrant_present <- sum(period_matrix[row_idx, immigrant_cols] == 1, na.rm = TRUE)
+        group_size <- total_present - immigrant_present
+      } else {
+        # If immigrant is not in the matrix, subtract 1 (assuming they were present)
+        group_size <- total_present - 1
+      }
+      
+      # Ensure group size is not negative
+      group_size <- max(0, group_size)
+      daily_group_sizes <- c(daily_group_sizes, group_size)
+    }
+    
+    # Calculate median group size
+    median_group_size <- median(daily_group_sizes, na.rm = TRUE)
+    min_group_size <- min(daily_group_sizes, na.rm = TRUE)
+    max_group_size <- max(daily_group_sizes, na.rm = TRUE)
+    
+    # Store results
+    group_size_results <- rbind(group_size_results, data.frame(
+      immigrant_code = immigrant_code,
+      group = group_abbreviation,
+      median_group_size = median_group_size,
+      min_group_size = min_group_size,
+      max_group_size = max_group_size,
+      days_observed = length(daily_group_sizes),
+      DateImmigration1 = start_date,
+      end_date = end_date,
+      end_date_type = end_date_col,
+      stringsAsFactors = FALSE
+    ))
+    
+    cat("Processed immigrant", immigrant_code, "- Median group size:", round(median_group_size, 1), 
+        "over", length(daily_group_sizes), "days (using", end_date_col, ")\n")
+  }
+  
+  return(group_size_results)
+}
+
+# Using all-conflicts Elo rating date
+group_size_data_all <- calculate_median_group_size(potential_immig, group_presence_matrices, end_date_col = "elo_rating_date_one_year_all")
+
+# Using male-male Elo rating date
+group_size_data_mm <- calculate_median_group_size(potential_immig, group_presence_matrices,
+end_date_col = "elo_rating_date_one_year_male_male")
+
+# Using LastSeen1
+group_size_data_last <- calculate_median_group_size(potential_immig, group_presence_matrices,
+  end_date_col = "LastSeen1")
+
+#Rename columns to be specific
+colnames(group_size_data_all)[3:8] <- paste0(colnames(group_size_data_all)[3:8], "_all")
+colnames(group_size_data_mm)[3:8] <- paste0(colnames(group_size_data_mm)[3:8], "_mm")
+colnames(group_size_data_last)[3:8] <- paste0(colnames(group_size_data_last)[3:8], "_last")
+
+# Merge all into one dataframe
+group_size_data <- group_size_data_all %>%
+  full_join(group_size_data_mm, by = c("immigrant_code", "group")) %>%
+  full_join(group_size_data_last, by = c("immigrant_code", "group"))
+
+#the group_size_data_mm and group_size_data_all are actually the same but just in case...
+write.csv(group_size_data, "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/median_group_sizes_post_dispersal_year.csv")
+
+group_size_data<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/median_group_sizes_post_dispersal_year.csv")
+
+cor.test(group_size_data$median_group_size_all, group_size_data$median_group_size_mm)
+#given the extreme high correlation, I only use the group sizes until the elo rating calculation date that uses all conflicts
+```
+
+The number of days observed in the group_sizes df is not 365 because the post-dispersal period is not exactly 365 almost in any case. In the oldest cases, the project had not started yet (2014-2015) and in the most recent ones, the data is not uploaded yet (2025).
+
+## Add normalize degree
+
+```{r}
+# Function to add normalized degree column to network metrics
+add_normalized_degree <- function(network_metrics, group_size_data,
+                                  median_col = "median_group_size_all",
+                                  output_col = "degree_normalized_all") {
+  
+  # Check if the median column exists in group_size_data
+  if (!median_col %in% colnames(group_size_data)) {
+    stop(paste("Column", median_col, "not found in group_size_data. Available columns:", 
+              paste(colnames(group_size_data), collapse = ", ")))
+  }
+  
+  # Merge network metrics with group size data
+  network_metrics_normalized <- network_metrics %>%
+    left_join(group_size_data %>% select(immigrant_code, !!sym(median_col)), 
+              by = "immigrant_code") %>%
+    mutate(
+      # Create normalized degree using the specified median column
+      !!output_col := ifelse(!is.na(!!sym(median_col)) & !!sym(median_col) > 0,
+                             degree / !!sym(median_col),
+                             NA)
+    ) %>%
+    select(-!!sym(median_col))  # Remove the temporary median column
+  
+  # Check for any missing group size data
+  missing_group_size <- network_metrics_normalized %>%
+    filter(is.na(!!sym(output_col))) %>%
+    select(immigrant_code, group)
+  
+  if (nrow(missing_group_size) > 0) {
+    warning("Missing or zero group size data for the following immigrants:")
+    print(missing_group_size)
+  }
+  
+  return(network_metrics_normalized)
+}
+
+# Usage examples:
+# Using all-conflicts median group size
+xdata_scan <- add_normalized_degree(xdata_scan, group_size_data,
+                                    median_col = "median_group_size_all",
+                                    output_col = "degree_normalized")
+
+#the individuals with missing data obviously don't get a normalized degree
+#gha is so far from birthday that is excluded
+xdata_scan <- xdata_scan %>% filter(immigrant_code != "gha")
+
+write.csv (xdata_scan, "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/Data/network_metrics_prox_male_female.csv")
+```
+
+# Maternal Effects on Male Rank (All Conflict-Based Rank)
+
+```{r}
+# Create dataset with complete cases
+complete_data <- potential_immig %>%
+  filter(
+    !is.na(mother_avg_elo),
+    !is.na(elo_one_year_all),
+    !is.na(n_conflicts_one_year_all),
+    n_conflicts_one_year_all >= 5
+  )
+
+complete_data <- complete_data %>%
+  mutate(tr_elo_one_year_all = case_when(
+    elo_one_year_all == 0 ~ 0.0001,
+    elo_one_year_all == 1 ~ 0.9999,
+    TRUE ~ elo_one_year_all
+  ))%>%
+  mutate(tr_elo_one_year_male_male = case_when(
+    elo_one_year_male_male == 0 ~ 0.0001,
+    elo_one_year_male_male == 1 ~ 0.9999,
+    TRUE ~ elo_one_year_male_male
+  ))
+
+model1 <- glmmTMB(tr_elo_one_year_all~ mother_avg_elo*ImmigrationGp1, complete_data, family = beta_family())
+
+model1_no_int <- glmmTMB(tr_elo_one_year_all~ mother_avg_elo+ImmigrationGp1, complete_data, family = beta_family())
+
+anova(model1, model1_no_int)
+#no significant effect of the interaction over the single terms
+
+check_lmer_assumptions_dharma(model1_no_int, "Male One Year Elo Model")
+
+model1_null <- glmmTMB(tr_elo_one_year_all ~ 1, data = complete_data,  family = beta_family())
+
+anova(model1, model1_null)
+
+anova(model1_null, model1_no_int)
+#both models differ from the null
+
+drop1(model1_no_int, test="Chisq")
+
+summary(model1)
+#it is the group driving this effect, not the mothers rank
+```
+
+## End of tenure rank
+
+```{r}
+complete_data_end <- potential_immig %>%
+  filter(
+    !is.na(mother_avg_elo),
+    !is.na(elo_end_tenure_all),
+    !is.na(n_conflicts_end_tenure_all),
+    n_conflicts_one_year_all >= 5
+  )
+
+complete_data_end <- complete_data_end %>%
+  mutate(tr_elo_end_tenure_all = case_when(
+    elo_end_tenure_all == 0 ~ 0.0001,
+    elo_end_tenure_all == 1 ~ 0.9999,
+    TRUE ~ elo_end_tenure_all
+  ))%>%
+  mutate(tr_elo_one_year_male_male = case_when(
+    elo_one_year_male_male == 0 ~ 0.0001,
+    elo_one_year_male_male == 1 ~ 0.9999,
+    TRUE ~ elo_one_year_male_male
+  ))
+
+model1_end <- glmmTMB(tr_elo_end_tenure_all~ mother_avg_elo*ImmigrationGp1, complete_data_end, family = beta_family())
+
+model1_no_int_end <- glmmTMB(tr_elo_end_tenure_all~ mother_avg_elo+ImmigrationGp1, complete_data_end, family = beta_family())
+
+anova(model1_end, model1_no_int_end)
+#no significant effect of the interaction over the single terms
+
+check_lmer_assumptions_dharma(model1_no_int_end, "Male End Tenure Elo Model")
+#no issue
+
+model1_null_end <- glmmTMB(tr_elo_end_tenure_all ~ 1, data = complete_data_end,  family = beta_family())
+
+anova(model1_end, model1_null_end)
+
+anova(model1_null_end, model1_no_int_end)
+#both models differ from the null
+
+drop1(model1_no_int, test="Chisq")
+```
+
+# Maternal Effects on Male Rank (Male-Male Interactions)
+
+```{r}
+# Create dataset with complete cases
+complete_data_mm <- complete_data[complete_data$n_conflicts_one_year_male_male>=5,]
+
+model1.mm <- glmmTMB(tr_elo_one_year_male_male ~ mother_avg_elo, complete_data_mm, family = beta_family())
+#group is not incldued because all males are immigrants of BD
+
+dharma_results1 <- check_lmer_assumptions_dharma(model1.mm, "Male One Year Elo Model")
+
+model1_null_mm <- glmmTMB(tr_elo_one_year_male_male ~ 1 , complete_data_mm, family = beta_family())
+
+anova(model1.mm, model1_null_mm)
+
+drop1(model1.mm, test="Chisq")
+#same
+
+#repeat for end of tenure
+complete_data_mm_end <- complete_data_end[complete_data_end$n_conflicts_end_tenure_male_male>=5,]
+
+complete_data_mm_end <- complete_data_mm_end %>%
+  mutate(tr_elo_end_tenure_male_male = case_when(
+    elo_end_tenure_male_male == 0 ~ 0.0001,
+    elo_end_tenure_male_male == 1 ~ 0.9999,
+    TRUE ~ elo_end_tenure_male_male
+  ))
+
+model1.mm_end <- glmmTMB(tr_elo_end_tenure_male_male ~ mother_avg_elo, complete_data_mm_end, family = beta_family())
+#group is not incldued because all males are immigrants of BD
+
+dharma_results1 <- check_lmer_assumptions_dharma(model1.mm, "Male One Year Elo Model")
+
+model1_null_mm_end <- glmmTMB(tr_elo_end_tenure_male_male ~ 1 , complete_data_mm_end, family = beta_family())
+
+anova(model1.mm_end, model1_null_mm_end)
+
+drop1(model1.mm, test="Chisq")
+#same
+```
+
+## Plot mat-son rank (both all cases and mm conflicts)
+
+```{r}
+library(ggplot2)
+library(ggeffects)
+library(patchwork)
+
+# Custom colors
+custom_colors <- c("#00CC99", "#1F78B4", "#7570B3", "#660000", "#336633", "#E6AB02", "#FF6600")
+
+# === PANEL A: All Conflicts ===
+# Get predictions (already on 0-1 scale from beta model)
+pred_all <- ggpredict(model1_no_int, terms = "mother_avg_elo [all]")
+# NO back-transformation needed - beta predictions are already 0-1
+
+# Count per group
+group_counts_all <- complete_data %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels_all <- setNames(group_counts_all$label, group_counts_all$ImmigrationGp1)
+
+plot_a <- ggplot() +
+  # Prediction ribbon and line (use standard columns)
+  geom_ribbon(data = pred_all,
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey50") +
+  geom_line(data = pred_all,
+            aes(x = x, y = predicted),
+            size = 1.5, color = "black") +
+  # Data points colored by group
+  geom_point(data = complete_data,
+             aes(x = mother_avg_elo, y = tr_elo_one_year_all, color = ImmigrationGp1),
+             size = 3, alpha = 0.7) +
+  # Panel label
+  annotate("text", x = -Inf, y = Inf, label = "A", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = custom_colors, labels = group_labels_all) +
+  labs(x = "Maternal Elo Rating",
+       y = "Offspring Elo at One Year\n(All Conflicts)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === PANEL B: Male-Male Conflicts ===
+# Get predictions for male-male model
+pred_mm <- ggpredict(model1.mm, terms = "mother_avg_elo [all]")
+
+# Count per group for male-male
+group_counts_mm <- complete_data_mm %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels_mm <- setNames(group_counts_mm$label, group_counts_mm$ImmigrationGp1)
+
+plot_b <- ggplot() +
+  # Prediction ribbon and line
+  geom_ribbon(data = as.data.frame(pred_mm),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey50") +
+  geom_line(data = as.data.frame(pred_mm),
+            aes(x = x, y = predicted),
+            size = 1.5, color = "black") +
+  # Data points colored by group
+  geom_point(data = complete_data_mm,
+             aes(x = mother_avg_elo, y = tr_elo_one_year_male_male, color = ImmigrationGp1),
+             size = 3, alpha = 0.7) +
+  # Panel label
+  annotate("text", x = -Inf, y = Inf, label = "B", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = custom_colors, labels = group_labels_mm) +
+  labs(x = "Maternal Elo Rating",
+       y = "Offspring Elo at One Year\n(Male-Male Conflicts)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === COMBINE PLOTS ===
+combined_plot <- plot_a | plot_b
+print(combined_plot)
+```
+
+# Rerun Analyses Excluding Less Habituated Groups
+
+Results don't differ
+
+```{r}
+# Filter out CR and LT groups
+complete_data_filtered <- complete_data %>%
+  filter(!ImmigrationGp1 %in% c("CR", "LT"))
+
+complete_data_mm_filtered <- complete_data_mm %>%
+  filter(!ImmigrationGp1 %in% c("CR", "LT"))
+
+# Refit model 1 (all conflicts) - logit + Gaussian
+model1_sub_noint <- glmmTMB(
+  tr_elo_one_year_all ~ mother_avg_elo, #no group because all individuals are from BD
+  data = complete_data_filtered,
+  family = beta_family())
+
+# Check diagnostics
+check_lmer_assumptions_dharma(model1_sub_noint, "All Conflicts - No CR/LT")
+
+# Test significance
+model1_sub_noint_null <- glmmTMB(
+  tr_elo_one_year_all ~ 1, 
+  data = complete_data_filtered,
+  family = beta_family())
+
+anova(model1_sub_noint, model1_sub_noint_null, test = "Chisq")
+#no significant difference
+
+# Refit model 2 (male-male)
+model1.mm_sub <- glmmTMB(tr_elo_one_year_male_male ~ mother_avg_elo, complete_data_mm_filtered, family = beta_family())
+
+# Check diagnostics
+check_lmer_assumptions_dharma(model1.mm_sub, "Male-Male - No CR/LT")
+
+model1.mm_sub_null <- glmmTMB(tr_elo_one_year_male_male ~ 1, complete_data_mm_filtered, family = beta_family())
+
+anova(model1.mm_sub,model1.mm_sub_null)
+#no effect
+```
+
+# GROOMING AD LIB DATA
+
+## Effects of Male Social Behaviour on Rank Acquired
+
+### All Conflicts Used to Calculate Rank and PCA
+
+I need to study separately the top ranking and the non-top ranking individuals because there is no way to have the model converging otherwise
+
+```{r}
+xdata_groom_all <- xdata_groom %>%
+  mutate(tr_elo_one_year_all = case_when(
+    elo_one_year_all == 0 ~ 0.0001,
+    elo_one_year_all == 1 ~ 0.9999,
+    TRUE ~ elo_one_year_all
+  ))
+
+xdata_groom_all_nottop <- xdata_groom_all %>%
+  filter(tr_elo_one_year_all < 0.99)
+
+#PCA 
+pca_groom_all <- prcomp(
+  xdata_groom_all_nottop[, c("grooming_rate", "total_degree_normalized", "eigenvector_centrality",
+                     "in_grooming_rate", "out_grooming_rate", 
+                     "in_degree_normalized", "out_degree_normalized")],
+scale. = TRUE, center = TRUE)
+
+# Check variance explained
+summary(pca_groom_all)
+print(pca_groom_all$rotation)  # See which variables load on which PCs
+
+# Scree plot
+screeplot(pca_groom_all, type = "lines")
+
+# Extract PCs
+xdata_groom_all_nottop$network_PC1 <- pca_groom_all$x[,1]
+xdata_groom_all_nottop$network_PC2 <- pca_groom_all$x[,2]
+
+# Model with PC1 only
+model2_allconflicts_pca1 <- glmmTMB(
+  tr_elo_one_year_all ~ ImmigrationGp1 + network_PC1,
+  data = xdata_groom_all_nottop, ziformula = ~ImmigrationGp1,
+  family = beta_family())
+
+check_lmer_assumptions_dharma(model2_allconflicts_pca1, "All conflicts PC1")
+
+# Model with PC1 + PC2
+model2_allconflicts_pca2 <- glmmTMB(
+  tr_elo_one_year_all ~ ImmigrationGp1 + network_PC1 + network_PC2,
+  ziformula = ~1,
+  data = xdata_groom_all_nottop, 
+  family = beta_family())
+
+check_lmer_assumptions_dharma(model2_allconflicts_pca2, "All conflicts PC1+PC2")
+
+# Compare
+AIC(model2_allconflicts_pca1, model2_allconflicts_pca2)
+
+model2_allconflicts_pca2_null <- glmmTMB(
+  tr_elo_one_year_all ~ 1,
+  ziformula = ~1,
+  data = xdata_groom_all_nottop, 
+  family = beta_family())
+
+anova(model2_allconflicts_pca2_null, model2_allconflicts_pca2)
+
+drop1(model2_allconflicts_pca2, test="Chisq")
+
+summary(model2_allconflicts_pca2)
+```
+
+### Male-Male Conflicts Used to Calculate Rank and PCA
+
+```{r}
+# Filter for male-male conflicts with sufficient data
+xdata_groom_sub <- xdata_groom %>%
+  filter(n_conflicts_one_year_male_male >= 5 & days_observed >= 10) %>%
+  mutate(tr_elo_one_year_male_male = case_when(
+    elo_one_year_male_male == 0 ~ 0.0001,
+    elo_one_year_male_male == 1 ~ 0.9999,
+    TRUE ~ elo_one_year_male_male
+  ))
+
+# Remove top-ranking individuals
+xdata_groom_sub_nottop <- xdata_groom_sub %>%
+  filter(tr_elo_one_year_male_male < 0.99)
+
+# PCA on network measures
+pca_groom_mm <- prcomp(
+  xdata_groom_sub_nottop[, c("grooming_rate", "total_degree_normalized", "eigenvector_centrality", "in_grooming_rate", "out_grooming_rate", "in_degree_normalized", "out_degree_normalized")], 
+scale. = TRUE,
+  center = TRUE)
+
+# Check variance explained
+summary(pca_groom_mm)
+print(pca_groom_mm$rotation)  # See which variables load on which PCs
+
+# Scree plot
+screeplot(pca_groom_mm, type = "lines")
+
+# Extract PCs
+xdata_groom_sub_nottop$network_PC1 <- pca_groom_mm$x[,1]
+xdata_groom_sub_nottop$network_PC2 <- pca_groom_mm$x[,2]
+
+# Model with PC1 only
+model2_mm_pca1 <- glmmTMB(
+  tr_elo_one_year_male_male ~ ImmigrationGp1 + network_PC1,
+  data = xdata_groom_sub_nottop, 
+  ziformula = ~ImmigrationGp1,
+  family = beta_family())
+
+check_lmer_assumptions_dharma(model2_mm_pca1, "Male-male PC1")
+
+# Model with PC1 + PC2
+model2_mm_pca2 <- glmmTMB(
+  tr_elo_one_year_male_male ~ ImmigrationGp1 + network_PC1 + network_PC2,
+  ziformula = ~1,
+  data = xdata_groom_sub_nottop, 
+  family = beta_family())
+
+check_lmer_assumptions_dharma(model2_mm_pca2, "Male-male PC1+PC2")
+
+# Compare
+AIC(model2_mm_pca1, model2_mm_pca2)
+
+model2_mm_pca2_null <- glmmTMB(
+  tr_elo_one_year_male_male ~ 1,
+  ziformula = ~1,
+  data = xdata_groom_sub_nottop, 
+  family = beta_family())
+
+anova(model2_mm_pca2_null, model2_mm_pca2)
+#non significant effect of grooming on rank in the male only hierarchy
+```
+
+For non top ranking individuals, there is no effect of grooming on the rank acquired in the male only hierarchy after one year but there is in the male-female hierarchy
+
+## Does Grooming Predict the Probability of Becoming High Ranking
+
+```{r}
+# Define top-ranked individuals for all conflicts
+xdata_groom_all <- xdata_groom_all %>%
+  mutate(is_top_rank_all = ifelse(tr_elo_one_year_all >= 0.99, 1, 0))
+
+# Check how many top-ranked
+table(xdata_groom_all$is_top_rank_all)
+
+# Add PCs to full dataset (not just nottop)
+pca_groom_all_full <- prcomp(
+  xdata_groom_all[, c("grooming_rate", "total_degree_normalized", "eigenvector_centrality",
+                     "in_grooming_rate", "out_grooming_rate", 
+                     "in_degree_normalized", "out_degree_normalized")],
+  scale. = TRUE, center = TRUE)
+
+xdata_groom_all$network_PC1 <- pca_groom_all_full$x[,1]
+xdata_groom_all$network_PC2 <- pca_groom_all_full$x[,2]
+
+# Logistic regression - all conflicts
+model_toprank_all <- glmmTMB(
+  is_top_rank_all ~  network_PC1 + network_PC2,
+  data = xdata_groom_all,
+  family = binomial())
+
+model_toprank_all_null <- glmmTMB(
+  is_top_rank_all ~ 1,
+  data = xdata_groom_all,
+  family = binomial())
+
+anova(model_toprank_all, model_toprank_all_null)
+
+drop1(model_toprank_all, test = "Chisq")
+
+summary(model_toprank_all)
+
+# Check assumptions
+check_lmer_assumptions_dharma(model_toprank_all, "Top rank all conflicts")
+
+# Define top-ranked for male-male conflicts
+xdata_groom_sub <- xdata_groom_sub %>%
+  mutate(is_top_rank_mm = ifelse(tr_elo_one_year_male_male >= 0.99, 1, 0))
+
+table(xdata_groom_sub$is_top_rank_mm)
+
+# Add PCs to full male-male dataset
+pca_groom_mm_full <- prcomp(
+  xdata_groom_sub[, c("grooming_rate", "total_degree_normalized", "eigenvector_centrality",
+                     "in_grooming_rate", "out_grooming_rate", 
+                     "in_degree_normalized", "out_degree_normalized")],
+  scale. = TRUE, center = TRUE)
+
+xdata_groom_sub$network_PC1 <- pca_groom_mm_full$x[,1]
+xdata_groom_sub$network_PC2 <- pca_groom_mm_full$x[,2]
+
+# Logistic regression - male-male conflicts
+model_toprank_mm <- glmmTMB(
+  is_top_rank_mm ~ ImmigrationGp1 + network_PC1 + network_PC2,
+  data = xdata_groom_sub,
+  family = binomial())
+
+model_toprank_mm_null <- glmmTMB(
+  is_top_rank_mm ~ 1,
+  data = xdata_groom_sub,
+  family = binomial())
+
+anova(model_toprank_mm, model_toprank_mm_null)
+
+summary(model_toprank_mm)
+
+drop1(model_toprank_mm, test = "Chisq")
+
+check_lmer_assumptions_dharma(model_toprank_mm, "Top rank male-male")
+```
+
+The results are consistent with more grooming leading both to higher ranks and to higher probabilities of top rank
+
+## Plot Grooming Relationship with Rank After One Year
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(gridExtra)
+library(ggeffects)
+
+# Custom colors
+custom_colors <- c("#00CC99", "#1F78B4", "#7570B3", "#660000", "#336633", "#E6AB02", "#FF6600")
+
+# Count per group for all conflicts
+group_counts_all <- xdata_groom_all_nottop %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels_all <- setNames(group_counts_all$label, group_counts_all$ImmigrationGp1)
+
+# Count per group for male-male
+group_counts_mm <- xdata_groom_sub_nottop %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels_mm <- setNames(group_counts_mm$label, group_counts_mm$ImmigrationGp1)
+
+# Get predictions from models
+pred_all_PC1 <- ggpredict(model2_allconflicts_pca2, terms = "network_PC1 [all]")
+pred_all_PC2 <- ggpredict(model2_allconflicts_pca2, terms = "network_PC2 [all]")
+pred_mm_PC1 <- ggpredict(model2_mm_pca2, terms = "network_PC1 [all]")
+pred_mm_PC2 <- ggpredict(model2_mm_pca2, terms = "network_PC2 [all]")
+
+# === ALL CONFLICTS - PC1 ===
+plot_all_PC1 <- ggplot() +
+  geom_ribbon(data = as.data.frame(pred_all_PC1),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey50") +
+  geom_line(data = as.data.frame(pred_all_PC1),
+            aes(x = x, y = predicted),
+            size = 1.5, color = "black") +
+  geom_point(data = xdata_groom_all_nottop,
+             aes(x = network_PC1, y = tr_elo_one_year_all, color = ImmigrationGp1),
+             size = 3, alpha = 0.7) +
+  annotate("text", x = -Inf, y = Inf, label = "A",
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = custom_colors, labels = group_labels_all) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(x = "PC1*",
+       y = "Elo Rating at One Year\n(All Conflicts)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === ALL CONFLICTS - PC2 ===
+plot_all_PC2 <- ggplot() +
+  geom_ribbon(data = as.data.frame(pred_all_PC2),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey50") +
+  geom_line(data = as.data.frame(pred_all_PC2),
+            aes(x = x, y = predicted),
+            size = 1.5, color = "black") +
+  geom_point(data = xdata_groom_all_nottop,
+             aes(x = network_PC2, y = tr_elo_one_year_all, color = ImmigrationGp1),
+             size = 3, alpha = 0.7) +
+  annotate("text", x = -Inf, y = Inf, label = "B",
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = custom_colors, labels = group_labels_all) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(x = "PC2*",
+       y = "Elo Rating at One Year\n(All Conflicts)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === MALE-MALE CONFLICTS - PC1 ===
+plot_mm_PC1 <- ggplot() +
+  geom_ribbon(data = as.data.frame(pred_mm_PC1),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey50") +
+  geom_line(data = as.data.frame(pred_mm_PC1),
+            aes(x = x, y = predicted),
+            size = 1.5, color = "black") +
+  geom_point(data = xdata_groom_sub_nottop,
+             aes(x = network_PC1, y = tr_elo_one_year_male_male, color = ImmigrationGp1),
+             size = 3, alpha = 0.7) +
+  annotate("text", x = -Inf, y = Inf, label = "C",
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = custom_colors, labels = group_labels_mm) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(x = "PC1",
+       y = "Elo Rating at One Year\n(Male-Male Conflicts)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === MALE-MALE CONFLICTS - PC2 ===
+plot_mm_PC2 <- ggplot() +
+  geom_ribbon(data = as.data.frame(pred_mm_PC2),
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey50") +
+  geom_line(data = as.data.frame(pred_mm_PC2),
+            aes(x = x, y = predicted),
+            size = 1.5, color = "black") +
+  geom_point(data = xdata_groom_sub_nottop,
+             aes(x = network_PC2, y = tr_elo_one_year_male_male, color = ImmigrationGp1),
+             size = 3, alpha = 0.7) +
+  annotate("text", x = -Inf, y = Inf, label = "D",
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  scale_color_manual(values = custom_colors, labels = group_labels_mm) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(x = "PC2",
+       y = "Elo Rating at One Year\n(Male-Male Conflicts)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === Combine plots ===
+combined_plot <- (plot_all_PC1 | plot_all_PC2) / (plot_mm_PC1 | plot_mm_PC2)
+print(combined_plot)
+```
+
+## Create PCA Loadings Table
+
+```{r}
+variance_all <- summary(pca_groom_all)$importance[2, 1:2] * 100
+variance_mm <- summary(pca_groom_mm)$importance[2, 1:2] * 100
+
+# Create comprehensive loadings dataframe
+loadings_table_combined <- data.frame(
+  Variable = c("Grooming rate",
+               "Total degree (normalized)",
+               "Eigenvector centrality",
+               "In-grooming rate",
+               "Out-grooming rate",
+               "In-degree (normalized)",
+               "Out-degree (normalized)"),
+  
+  # All conflicts PCA
+  All_Conflicts_PC1 = round(pca_groom_all$rotation[c("grooming_rate",
+                                                      "total_degree_normalized",
+                                                      "eigenvector_centrality",
+                                                      "in_grooming_rate",
+                                                      "out_grooming_rate",
+                                                      "in_degree_normalized",
+                                                      "out_degree_normalized"), 1], 3),
+  
+  All_Conflicts_PC2 = round(pca_groom_all$rotation[c("grooming_rate",
+                                                      "total_degree_normalized",
+                                                      "eigenvector_centrality",
+                                                      "in_grooming_rate",
+                                                      "out_grooming_rate",
+                                                      "in_degree_normalized",
+                                                      "out_degree_normalized"), 2], 3),
+  
+  # Male-male conflicts PCA
+  Male_Male_PC1 = round(pca_groom_mm$rotation[c("grooming_rate",
+                                                  "total_degree_normalized",
+                                                  "eigenvector_centrality",
+                                                  "in_grooming_rate",
+                                                  "out_grooming_rate",
+                                                  "in_degree_normalized",
+                                                  "out_degree_normalized"), 1], 3),
+  
+  Male_Male_PC2 = round(pca_groom_mm$rotation[c("grooming_rate",
+                                                  "total_degree_normalized",
+                                                  "eigenvector_centrality",
+                                                  "in_grooming_rate",
+                                                  "out_grooming_rate",
+                                                  "in_degree_normalized",
+                                                  "out_degree_normalized"), 2], 3))
+
+# Sort by All_Conflicts_PC1 loading (absolute value)
+loadings_table_combined <- loadings_table_combined %>%
+  arrange(desc(abs(All_Conflicts_PC1)))
+
+# Add variance explained rows
+variance_row <- data.frame(
+  Variable = "Variance Explained (%)",
+  All_Conflicts_PC1 = round(variance_all[1], 1),
+  All_Conflicts_PC2 = round(variance_all[2], 1),
+  Male_Male_PC1 = round(variance_mm[1], 1),
+  Male_Male_PC2 = round(variance_mm[2], 1))
+
+loadings_table_final <- rbind(loadings_table_combined, variance_row)
+
+# Print to console
+print(loadings_table_final)
+
+# Save as CSV
+write.csv(loadings_table_final, 
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Pooja_chapter_matrank/manuscript/PCA_loadings_grooming_rank.csv",
+          row.names = FALSE)
+```
+
+## Effects of Maternal Rank on Social Behaviours
+
+### PCA to Reduce Number of Models
+
+As there are 7 variables
+
+```{r}
+xdata_groom_pca <- xdata_groom %>%
+  filter(complete.cases(
+    total_degree_normalized, grooming_rate, in_grooming_rate, 
+    out_grooming_rate, in_degree_normalized, out_degree_normalized,
+    eigenvector_centrality, mother_avg_elo, ImmigrationGp1
+  ))
+#18 individuals only (because few males have mother elo)
+
+social_metrics <- xdata_groom_pca %>%
+  select(total_degree_normalized, grooming_rate, in_grooming_rate,
+         out_grooming_rate, in_degree_normalized, out_degree_normalized,
+         eigenvector_centrality)
+
+pca_result <- prcomp(social_metrics, scale. = TRUE, center = TRUE)
+
+summary(pca_result)
+
+# Variance explained
+var_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+
+print(round(pca_result$rotation[, 1:2], 2))
+
+cat("\nVariance explained by each PC:\n")
+print(round(var_explained * 100, 1))
+
+xdata_groom_pca$PC1 <- pca_result$x[, 1]
+xdata_groom_pca$PC2 <- pca_result$x[, 2]
+
+model_PC1 <- lm(PC1 ~ mother_avg_elo + group, data = xdata_groom_pca)
+
+model_PC1_null<-lm(PC1 ~  group, data = xdata_groom_pca)
+
+anova(model_PC1,model_PC1_null)
+#not significant
+
+par(mfrow = c(2, 2))
+plot(model_PC1)
+
+model_PC2 <- lm(PC2 ~ mother_avg_elo + group, data = xdata_groom_pca)
+
+model_PC2_null<-lm(PC2 ~  group, data = xdata_groom_pca)
+
+anova(model_PC2,model_PC2_null)
+#not significant
+
+par(mfrow = c(2, 2))
+plot(model_PC2)
+```
+
+### Plot PCA Results
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(grid)
+library(gridExtra)
+
+# Custom colors
+custom_colors <- c("#00CC99", "#1F78B4", "#7570B3", "#660000", "#336633", "#E6AB02", "#FF6600")
+
+# Count per group
+group_counts <- xdata_groom_pca %>%
+  group_by(group) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(group, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$group)
+
+# === Create loading tables - CORRECTED ===
+# Get the actual variable names from PCA
+var_names <- rownames(pca_result$rotation)
+
+# PC1 loadings - directly from PCA result
+loadings_PC1 <- data.frame(
+  Variable = c("Out-degree", "Out-groom rate", "Total degree",
+               "In-degree", "Grooming rate", "In-groom. rate", "Eigen. Centr."),
+  Loading = round(pca_result$rotation[, 1], 2)) %>%
+  arrange(desc(abs(Loading)))
+
+# PC2 loadings - directly from PCA result
+loadings_PC2 <- data.frame(
+  Variable = c("Out-degree", "Out-groom rate", "Total degree",
+               "In-degree", "Grooming rate", "In-groom. rate", "Eigen. Centr."),
+  Loading = round(pca_result$rotation[, 2], 2)) %>%
+  arrange(desc(abs(Loading)))
+
+# Convert to grobs
+table_PC1 <- tableGrob(loadings_PC1, rows = NULL,
+                       theme = ttheme_minimal(
+                         base_size = 9,
+                         core = list(bg_params = list(fill = "white", alpha = 0.5, col = "grey50")),
+                         colhead = list(bg_params = list(fill = "grey90", alpha = 0.9, col = "grey50"))
+                       ))
+
+table_PC2 <- tableGrob(loadings_PC2, rows = NULL,
+                       theme = ttheme_minimal(
+                         base_size = 9,
+                         core = list(bg_params = list(fill = "white", alpha = 0.5, col = "grey50")),
+                         colhead = list(bg_params = list(fill = "grey90", alpha = 0.9, col = "grey50"))
+                       ))
+
+# Fixed positions - centered at x=0.8, y=2.8
+# Assuming table width ~0.25 and height ~1.5
+table_width <- 0.25
+table_height <- 1.5
+
+# PC1 - center at (0.8, 2.8)
+x_min_PC1 <- 0.85 - table_width/2
+x_max_PC1 <- 0.85 + table_width/2
+y_min_PC1 <- 3 - table_height/2
+y_max_PC1 <- 3 + table_height/2
+
+# PC2 - center at (0.8, 2.8) - adjust if y range is different
+x_min_PC2 <- 0.85 - table_width/2
+x_max_PC2 <- 0.85 + table_width/2
+y_min_PC2 <- 1.13 - table_height/2
+y_max_PC2 <- 1.13 + table_height/2
+
+# === PC1 plot ===
+plot_PC1 <- ggplot(xdata_groom_pca, aes(x = mother_avg_elo, y = PC1)) +
+  geom_point(aes(color = group), size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", fill = "grey50", alpha = 0.2) +
+  annotate("text", x = -Inf, y = Inf, label = "A", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  annotation_custom(table_PC1,
+                    xmin = x_min_PC1, xmax = x_max_PC1,
+                    ymin = y_min_PC1, ymax = y_max_PC1) +
+  scale_color_manual(values = custom_colors, labels = group_labels) +
+  labs(x = "Maternal Elo Rating",
+       y = "PC1: Overall Social Integration\n(59% variance)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# === PC2 plot ===
+plot_PC2 <- ggplot(xdata_groom_pca, aes(x = mother_avg_elo, y = PC2)) +
+  geom_point(aes(color = group), size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", fill = "grey50", alpha = 0.2) +
+  annotate("text", x = -Inf, y = Inf, label = "B", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold") +
+  annotation_custom(table_PC2,
+                    xmin = x_min_PC2, xmax = x_max_PC2,
+                    ymin = y_min_PC2, ymax = y_max_PC2) +
+  scale_color_manual(values = custom_colors, labels = group_labels) +
+  labs(x = "Maternal Elo Rating",
+       y = "PC2: Selective vs Indiscriminate grooming \n(25.7% variance)",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.y = unit(-0.1, "cm"))
+
+# Combine side by side
+combined_plot <- plot_PC1 | plot_PC2
+print(combined_plot)
+```
+
+PC2 interpretation: positive PC2 = Receives grooming from well-connected individuals (high eigenvector, high in-grooming) but has fewer total partners (negative degree loadings) → selective about partners. Low PC2 = "Promiscuous Groomer" - has many grooming partners (high degree in all directions) but not necessarily connected to central individuals (low eigenvector) → grooms widely
+
+# SCAN PROXIMITY DATA
+
+## Males' Proximity Behaviour Effects on Rank
+
+```{r}
+#gha is really far  from his birthday so won't be considered. They need to have at least 10 scans and at least 5 conflicts for the calculation of the rank
+xdata_scan_sub<-subset(xdata_scan, total_scans >= 10 & n_conflicts_one_year_all >= 5)
+#54 males
+
+xdata_scan_sub <- xdata_scan_sub %>%
+  mutate(tr_elo_one_year_all = case_when(
+    elo_one_year_all == 0 ~ 0.0001,
+    elo_one_year_all == 1 ~ 0.9999,
+    TRUE ~ elo_one_year_all))
+
+model11 <- glmmTMB(tr_elo_one_year_all~ degree_normalized +strength_assoc+ eigenvector_centrality + ImmigrationGp1, xdata_scan_sub, family = beta_family())
+
+dharma_results2 <- check_lmer_assumptions_dharma(model11, "male_one_year_elo")
+#tests are fine but visually there are patterns
+
+model11_null <- glmmTMB(tr_elo_one_year_all~ ImmigrationGp1, xdata_scan_sub, family = beta_family())
+
+anova(model11, model11_null)
+#no effect of proximity interactions in males rank
+
+summary(model11)
+
+#now only with male-male conflicts
+xdata_scan_sub2<-subset(xdata_scan, total_scans >= 10 & n_conflicts_one_year_male_male >= 5)
+#51 males
+
+xdata_scan_sub2 <- xdata_scan_sub2 %>%
+  mutate(tr_elo_one_year_male_male = case_when(
+    elo_one_year_male_male == 0 ~ 0.0001,
+    elo_one_year_male_male == 1 ~ 0.9999,
+    TRUE ~ elo_one_year_male_male))
+
+model11mm <- glmmTMB(tr_elo_one_year_male_male~ degree_normalized +strength_assoc+ eigenvector_centrality + ImmigrationGp1, xdata_scan_sub2, family = beta_family())
+
+dharma_results2 <- check_lmer_assumptions_dharma(model11mm, "male_one_year_elo")
+# the residuals show a bit of a pattern (heterodascity violated) but the test passes ( KS p = 0.06)
+
+# Correlations
+cor_matrix <- xdata_scan_sub2 %>%
+  select(degree_normalized, strength_assoc, eigenvector_centrality) %>%
+  cor(use = "complete.obs")
+#max cor of 0.5
+
+model11mm_null <- glmmTMB(tr_elo_one_year_male_male~ ImmigrationGp1, xdata_scan_sub2, family = beta_family())
+
+anova(model11mm, model11mm_null)
+#also not significant
+
+summary(model11mm)
+```
+
+## Mother Rank Effect on Degree, Association Rate and Centrality
+
+### Degree
+
+```{r}
+# Create dataset with complete cases scan
+complete_data_scan <- xdata_scan[complete.cases(xdata_scan[c("mother_avg_elo")]), ]
+
+complete_data_scan<-subset(complete_data_scan, total_scans >= 10)
+#11 individuals have mother elo and proximity network metrics built from 10 or more scans.
+
+complete_data_scan<-complete_data_scan%>%
+  mutate(year_immig = lubridate::year(as.Date(DateImmigration1)))
+
+model12 <- glmmTMB(degree_normalized ~ mother_avg_elo +ImmigrationGp1, complete_data_scan, family = beta_family()) 
+
+dharma_results2 <- check_lmer_assumptions_dharma(model12, "degree_normalized")
+
+model12_null<-glmmTMB(degree_normalized ~ ImmigrationGp1, complete_data_scan, family = beta_family())
+
+anova(model12, model12_null)
+
+summary(model12)
+
+drop1(model12, test="Chisq")
+
+pred <- ggpredict(model12, terms = "mother_avg_elo [all]")
+
+# Custom colors
+custom_colors <- c("#00CC99", "#1F78B4",  "#660000", "#336633", "#E6AB02", "#FF6600")
+
+# Count per group for labels
+group_counts <- complete_data_scan %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$ImmigrationGp1)
+
+# Plot
+p1 <- ggplot() + 
+  # Ribbon and line
+  geom_ribbon(data = pred, 
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = pred, 
+            aes(x = x, y = predicted), 
+            color = "black", linewidth = 1) +
+  # Points colored by group
+  geom_point(data = complete_data_scan,
+             aes(x = mother_avg_elo, y = degree_normalized, color = ImmigrationGp1), 
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = custom_colors, labels = group_labels) +
+  xlim(0, 1) +
+  labs(x = "Mother Elo Rating**",
+       y = "Normalized Degree",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 16), 
+legend.spacing.y = unit(-0.1, "cm")) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+print(p1)
+```
+
+### Strength_assoc (Association Rate)
+
+Strength here are the summed dyadic association rates for each individual, where dyadic association rate is the number of scans with dyadic co-occurrence out of all the scans in which either or both dyad members were recorded
+
+```{r}
+model13 <- glmmTMB(strength_assoc ~ mother_avg_elo ,
+                      data = complete_data_scan,
+                      family = beta_family(), ziformula = ~ImmigrationGp1)
+
+dharma_results2 <- check_lmer_assumptions_dharma(model13, "strength_assoc")
+#visually no great
+
+#plot to see if relationship is not linear
+plot(complete_data_scan$mother_avg_elo,
+     complete_data_scan$strength_assoc,
+     pch = 19, cex = 1.5,
+     xlab = "Mother Elo", ylab = "Association Strength")
+
+abline(lm(strength_assoc ~ mother_avg_elo, data = complete_data_scan),
+       col = "red", lwd = 2)
+
+lines(lowess(complete_data_scan$mother_avg_elo,
+             complete_data_scan$strength_assoc),
+      col = "blue", lwd = 2)
+
+legend("topright", c("Linear", "Loess"), col = c("red", "blue"), lwd = 2)
+#it is not, so I add a quadratic term
+
+model13 <- glmmTMB(strength_assoc ~ mother_avg_elo +I(mother_avg_elo^2) +ImmigrationGp1,
+                      data = complete_data_scan,
+                      family = beta_family(), ziformula = ~ImmigrationGp1)
+
+dharma_results2 <- check_lmer_assumptions_dharma(model13, "strength_assoc")
+#now is happier
+
+model13_null<-glmmTMB(strength_assoc ~ 1 +ImmigrationGp1,
+                      data = complete_data_scan,
+                      family = beta_family())
+#no interaction with group
+
+anova(model13, model13_null)
+
+summary(model13)
+
+drop1(model13, test="Chisq")
+
+# Custom colors
+custom_colors <- c("#00CC99", "#1F78B4", "#660000", "#336633", "#E6AB02", "#FF6600")
+
+# Count per group for labels
+group_counts <- complete_data_scan %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$ImmigrationGp1)
+
+# Get predictions
+pred <- ggpredict(model13, terms = "mother_avg_elo [all]")
+
+# Plot
+p2 <- ggplot() + 
+  # Ribbon and line
+  geom_ribbon(data = pred, 
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = pred, 
+            aes(x = x, y = predicted), 
+            color = "black", linewidth = 1) +
+  # Points colored by group
+  geom_point(data = complete_data_scan,
+             aes(x = mother_avg_elo, y = strength_assoc, color = ImmigrationGp1), 
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = custom_colors, labels = group_labels) +
+  xlim(0, 1) +
+  labs(x = "Mother Elo Rating*",
+       y = "Association Rate",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 16), 
+legend.spacing.y = unit(-0.1, "cm")) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+print(p2)
+```
+
+### Eigenvector Centrality
+
+```{r}
+complete_data_scan <- complete_data_scan %>%
+  mutate(eigen_transformed = case_when(
+    eigenvector_centrality == 0 ~ 0.0001,
+    eigenvector_centrality == 1 ~ 0.9999,
+    TRUE ~ eigenvector_centrality
+  ))
+
+model14 <- glmmTMB(eigen_transformed ~ mother_avg_elo+ I(mother_avg_elo^2)+ImmigrationGp1,
+data = complete_data_scan,
+family = beta_family())
+
+dharma_results2 <- check_lmer_assumptions_dharma(model14, "eigen_transformed")
+#four individuals have almost 0 centrality and i can't exclude them because i run out of individuals. 
+
+model14_null <- glmmTMB(eigen_transformed ~ ImmigrationGp1, data = complete_data_scan,
+family = beta_family())
+
+anova(model14, model14_null)
+
+drop1(model14, test="Chisq")
+
+summary(model14)
+
+# Custom colors
+custom_colors <- c("#00CC99", "#1F78B4", "#660000", "#336633", "#E6AB02", "#FF6600")
+
+# Count per group for labels
+group_counts <- complete_data_scan %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(n = n()) %>%
+  mutate(label = paste0(ImmigrationGp1, " (n=", n, ")"))
+
+group_labels <- setNames(group_counts$label, group_counts$ImmigrationGp1)
+
+# Get predictions from quadratic model
+pred <- ggpredict(model14, terms = "mother_avg_elo [all]")
+
+# Plot
+p3 <- ggplot() + 
+  # Ribbon and line
+  geom_ribbon(data = pred, 
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2, fill = "grey80", color = NA) +
+  geom_line(data = pred, 
+            aes(x = x, y = predicted), 
+            color = "black", linewidth = 1) +
+  # Points colored by group
+  geom_point(data = complete_data_scan,
+             aes(x = mother_avg_elo, y = eigen_transformed, color = ImmigrationGp1), 
+             size = 3, alpha = 0.7) +
+  scale_color_manual(values = custom_colors, labels = group_labels) +
+  xlim(0, 1) +
+  labs(x = "Maternal Elo Rating",
+       y = "Eigenvector Centrality",
+       color = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top",
+        legend.direction = "horizontal",
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 16), 
+        legend.spacing.y = unit(-0.1, "cm")) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+print(p3)
+```
+
+### Combined Proximity Plots
+
+```{r}
+# Add labels to each individual plot
+p1 <- p1 + annotate("text", x = -Inf, y = Inf, label = "A", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+
+p2 <- p2 + annotate("text", x = -Inf, y = Inf, label = "B", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+
+p3 <- p3 + annotate("text", x = -Inf, y = Inf, label = "C", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+
+plot1 <- plot1 + annotate("text", x = -Inf, y = Inf, label = "D", 
+           hjust = -0.5, vjust = 1.5, size = 6, fontface = "bold")
+
+# Then combine
+combined_plot <- plot_grid(p1, p2, p3, plot1,
+                          ncol = 2,
+                          nrow = 2) 
+
+# Display the plot
+combined_plot
+```
+
+# Supplementary Figure: Comparing Ad Lib and Scans
+
+```{r}
+# Set up a 2x2 panel layout
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+# Match the data
+matched_data <- merge(xdata_groom, xdata_scan,
+                      by = "immigrant_code",
+                      all = FALSE)
+
+# 1. Standardized Degree
+cor_result2 <- cor.test(matched_data$total_degree_normalized, matched_data$degree_normalized)
+
+plot(matched_data$total_degree_normalized, matched_data$degree_normalized,
+     xlab = "Norm Degree (Grooming, adlib)",
+     ylab = "Norm Degree (Proximity, scan)",
+     main = paste("Normalized Degree\nr =", round(cor_result2$estimate, 3),
+                  ", p =", round(cor_result2$p.value, 4)),
+     pch = 16, col = "steelblue")
+
+abline(lm(degree_normalized ~ total_degree_normalized, data = matched_data),
+       col = "red", lwd = 2)
+
+# 2. Standardized Strength
+cor_result4 <- cor.test(matched_data$grooming_rate, matched_data$strength_assoc)
+
+plot(matched_data$grooming_rate, matched_data$strength_assoc,
+     xlab = "Rate (Grooming, adlib)",
+     ylab = "Rate Strength (Proximity, scan)",
+     main = paste("Rate\nr =", round(cor_result4$estimate, 3),
+                  ", p =", round(cor_result4$p.value, 4)),
+     pch = 16, col = "steelblue")
+
+abline(lm(strength_assoc ~ grooming_rate, data = matched_data),
+       col = "red", lwd = 2)
+
+# Reset to single panel
+par(mfrow = c(1, 1))
+```
