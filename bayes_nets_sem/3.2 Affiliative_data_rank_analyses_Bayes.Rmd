@@ -1,0 +1,84 @@
+---
+title: "Immigrant_affiliative_data_rank_project"
+author: "Alba Motes Rodrigo"
+date: "2025-05-08"
+output: html_document
+---
+```{r}
+library(dplyr)
+library(tidyr)
+library(igraph)
+library(purrr)
+```
+
+```{r}
+#The "event" for dyad A→B is the number of days A groomed B, and the "duration" is the total observation days for that pair.
+emigrants<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/All_potential_immigrants_Josie_version.csv")
+#read grooming_dataset
+grooming_data<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/grooming_data2010_2025.csv")
+#to count number of adlib days per group
+affiliative <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/adlib/affiliative.csv")
+#group presence matrices
+group_presence_matrices <- readRDS(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/group_presence_matrices.rds"
+)
+
+```
+
+#Calculate grooming network metrics in the groups were males immigrated from the year postimmigration
+
+This scrip generates two files:
+1. csv called network_mets_groom_bayes.csv with the networ metrics 
+2. rds file called groom_posteriors.rds with the posterior draws that we will use for the models
+```{r}
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Analyses/bayes_nets_sem/bison_groom_net_script.R")
+```
+132 males with posteriors
+
+Variable explanation:
+Here's how each output column is calculated:
+Identification:
+
+Code — the immigrant male's ID
+group — the group he immigrated into
+start_date — immigration date
+end_date — immigration date + 365 days
+
+Bayesian in-strength (how much others groom this male):
+
+For each directed dyad X→male, we sample edge weights from Beta(0.1 + days_X_groomed_male, 0.1 + observation_days - days_X_groomed_male)
+In-strength = sum of all incoming edge weights for the focal male in each posterior draw
+in_strength_mean / _lower / _upper — mean and 95% credible interval across 1000 draws
+
+Bayesian out-strength (how much this male grooms others):
+
+Same as above but for dyads male→X
+Out-strength = sum of all outgoing edge weights
+out_strength_mean / _lower / _upper
+
+Bayesian in-degree (number of individuals who groom this male):
+
+Count of non-zero incoming edges per posterior draw
+in_degree_mean / _lower / _upper
+
+Bayesian out-degree (number of individuals this male grooms):
+
+Count of non-zero outgoing edges per posterior draw
+out_degree_mean / _lower / _upper
+
+Bayesian eigenvector centrality:
+
+For each draw, the directed network is collapsed to undirected (summing edge weights in both directions) and eigenvector centrality is computed via igraph::eigen_centrality()
+Captures how well-connected the male's grooming partners are
+eigenvector_mean / _lower / _upper
+
+Classic grooming rate (non-Bayesian):
+
+grooming_rate = number of distinct days the male was involved in ANY grooming (giving or receiving) / total observation days in that group and window. A simple point estimate with no uncertainty.
+
+Sampling info:
+
+days_observed — number of distinct days with ad-lib affiliative data in that group during the 365-day window (the denominator for all rates)
+median_group_size — median daily group size from the presence matrix during the window
+n_dyads — total number of directed grooming dyads in the network (not just the focal male's)
+

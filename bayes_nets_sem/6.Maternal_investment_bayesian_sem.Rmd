@@ -1,0 +1,638 @@
+---
+title: "7. Maternal_investment_v6_bayesian (restructured to match script 5v5)"
+author: "Alba Motes Rodrigo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+Restructured to follow the EXACT analytical pattern of script 5v5
+(maternal rank mediation), rather than the earlier generic
+predictor-parameterized double loop. Concretely:
+
+  - Script 5v5 runs ONE fixed predictor (maternal_elo_z) through a
+    "compile once on draw 1, then update() per subsequent draw" joint
+    brms model, looping over a single mediator_specs list, with one
+    TEST chunk and one FULL RUN chunk that saves PARTIAL results after
+    each mediator and a final combined output at the end.
+
+  - This script now does exactly that TWICE - once for each maternal
+    investment predictor (mom_groom_proportion, mom_prox_proportion) -
+    as two independent, sequential pipelines, each with its own
+    sem_data, its own TEST chunk, and its own FULL RUN chunk. The two
+    full runs are then combined at the end into a single results
+    table/rds, matching the original script 7 output files.
+
+The underlying model is unchanged from script 7's prior version and
+still carries BOTH validated fixes from script 5v5:
+
+  1. weights(obs_weight) implements a FREQUENCY-type weight in brms
+     (as if an observation with weight 0.25 contributes a quarter of a
+     full observation), not measurement-precision downweighting.
+     FIXED: sigma ~ obs_weight (heteroscedastic/distributional
+     regression) is used in BOTH equations instead.
+
+  2. Fitting mediator and outcome equations as two SEPARATE brm()
+     calls approximates p(a|D1) x p(b|D2), not the genuine joint
+     posterior p(a,b|D). FIXED: both equations are fit as ONE joint
+     multivariate brms model (bf_mediator + bf_outcome), so a, b, c'
+     are drawn together, properly paired, from the same MCMC draws.
+
+Residual correlation (set_rescor) is NOT included - tested in script
+5v5 and found not well identified at this sample size.
+
+Convergence must be checked via summarise_draws(as_draws_df(fit)), NOT
+posterior::ess_bulk(as_draws_array(fit)) - the latter returned spurious
+NA/near-zero values during validation testing.
+
+Predictors (run sequentially, each as its own full script-5-style
+pipeline): mom_groom_proportion, mom_prox_proportion.
+Mediators (same 6 raw network mediators as script 5v5, reused for both
+predictor pipelines): prox_strength, prox_degree, groom_out_strength,
+groom_in_strength, groom_out_degree, groom_in_degree. (PC1/PC2 dropped.)
+Outcome: elo_one_year_male_male (same-sex-only, matching script
+5v4/5v5's convention).
+
+```{r setup}
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(brms)
+library(posterior)
+```
+
+# Load data
+
+```{r load-data}
+emigrants_full <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/emigrants_full_merged.csv"
+)
+
+grooming_data <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/grooming_data2010_2025.csv"
+)
+
+scans <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scans_for_bison.csv"
+)
+
+prox_posteriors <- readRDS(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/prox_posteriors.rds"
+)
+groom_posteriors <- readRDS(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/groom_posteriors.rds"
+)
+
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Analyses/scan_extraction_1mandarm.R")
+
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK",
+                          "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing" = "CR",
+                          "IFamily" = "IF")
+
+grooming_data$date <- as.Date(grooming_data$date)
+grooming_data$idindividual1 <- tolower(as.character(grooming_data$idindividual1))
+grooming_data$idindividual2 <- tolower(as.character(grooming_data$idindividual2))
+grooming_data$group_Abbreviation <- group_abbreviations[grooming_data$group]
+
+emigrants_full$Code <- tolower(emigrants_full$Code)
+emigrants_full$Momcode <- tolower(emigrants_full$Momcode)
+emigrants_full$DOB <- as.Date(emigrants_full$DOB)
+emigrants_full$juvenile_period_end <- as.Date(emigrants_full$juvenile_period_end)
+emigrants_full$DateImmigration1 <- as.Date(emigrants_full$DateImmigration1)
+emigrants_full$DepartureNatalGp <- as.Date(emigrants_full$DepartureNatalGp)
+emigrants_full$LastSeen1 <- as.Date(emigrants_full$LastSeen1)
+```
+
+# Compute observation weight (used as a sigma predictor, not a likelihood weight)
+
+```{r compute-weight}
+emigrants_full <- emigrants_full %>%
+  mutate(
+    start_date_effective = if_else(!is.na(DateImmigration1),
+                                    DateImmigration1,
+                                    DepartureNatalGp),
+    window_end = start_date_effective + 365,
+    effective_end = if_else(!is.na(LastSeen1) & LastSeen1 < window_end,
+                             LastSeen1, window_end),
+    days_present_first_year = pmin(as.numeric(effective_end - start_date_effective), 365),
+    obs_weight = days_present_first_year / 365
+  )
+```
+
+# 1. Build maternal investment predictors
+
+## 1a. Maternal grooming investment
+
+```{r maternal-grooming}
+emigrants_full$mom_groom_days_to_son <- NA
+emigrants_full$mom_total_groom_days <- NA
+emigrants_full$mom_groom_proportion <- NA
+
+for (i in seq_len(nrow(emigrants_full))) {
+  mom <- emigrants_full$Momcode[i]; son <- emigrants_full$Code[i]
+  grp <- emigrants_full$BirthGp[i]; dob <- emigrants_full$DOB[i]
+  period_end <- emigrants_full$juvenile_period_end[i]
+
+  if (any(is.na(c(mom, son, grp, dob))) || is.na(period_end) || mom == "" || son == "") next
+
+  mom_groom <- grooming_data %>%
+    filter(idindividual1 == mom, group_Abbreviation == grp, date >= dob, date <= period_end)
+
+  if (nrow(mom_groom) == 0) next
+
+  total_days <- n_distinct(mom_groom$date)
+  days_to_son <- mom_groom %>% filter(idindividual2 == son) %>% summarise(n = n_distinct(date)) %>% pull(n)
+
+  emigrants_full$mom_groom_days_to_son[i] <- days_to_son
+  emigrants_full$mom_total_groom_days[i]  <- total_days
+  emigrants_full$mom_groom_proportion[i]  <- days_to_son / total_days
+}
+```
+
+## 1b. Maternal proximity investment
+
+```{r maternal-proximity}
+close_categories <- c("Holding/Clinging", "Contact", "Arm's Length", "Around (<5m)", "<5m")
+emigrants_full$mom_prox_with_son <- NA
+emigrants_full$mom_son_total_scans <- NA
+emigrants_full$mom_prox_proportion <- NA
+
+for (i in seq_len(nrow(emigrants_full))) {
+  mom <- emigrants_full$Momcode[i]; son <- emigrants_full$Code[i]
+  grp <- emigrants_full$BirthGp[i]; dob <- emigrants_full$DOB[i]
+  period_end <- emigrants_full$juvenile_period_end[i]
+
+  if (any(is.na(c(mom, son, grp, dob))) || is.na(period_end) || mom == "" || son == "") next
+
+  mom_scans <- scans %>%
+    mutate(date = as.Date(date)) %>%
+    filter(tolower(idindividual1) == mom, group_Abbreviation == grp, date >= dob, date <= period_end)
+
+  if (nrow(mom_scans) == 0) next
+
+  n_total <- nrow(mom_scans)
+  n_close <- sum(mom_scans$infant %in% close_categories, na.rm = TRUE)
+
+  emigrants_full$mom_prox_with_son[i]   <- n_close
+  emigrants_full$mom_son_total_scans[i] <- n_total
+  emigrants_full$mom_prox_proportion[i] <- n_close / n_total
+}
+
+write.csv(emigrants_full,
+          file.path("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/emigrants_full_merged.csv"),
+          row.names = FALSE)
+```
+
+# 2. Filter for males with all data available (one sem_data per predictor)
+
+
+```{r filter}
+sem_data_groom <- emigrants_full %>%
+  filter(!is.na(mom_groom_proportion),
+         !is.na(elo_one_year_male_male),
+         !is.na(obs_weight))
+
+sem_data_prox <- emigrants_full %>%
+  filter(!is.na(mom_prox_proportion),
+         !is.na(elo_one_year_male_male),
+         !is.na(obs_weight))
+
+cat("Sample size for grooming-investment SEM:", nrow(sem_data_groom), "\n")
+cat("Sample size for proximity-investment SEM:", nrow(sem_data_prox), "\n")
+```
+
+```{r}
+# Diagnostic: compare sem_data_groom vs sem_data_prox
+# Run this right after building sem_data_groom / sem_data_prox
+
+# 1. Are they literally the same set of individuals?
+codes_groom <- sort(sem_data_groom$Code)
+codes_prox  <- sort(sem_data_prox$Code)
+
+cat("Identical Code sets:", identical(codes_groom, codes_prox), "\n")
+cat("N groom:", length(codes_groom), " N prox:", length(codes_prox), "\n")
+cat("In groom but not prox:", setdiff(codes_groom, codes_prox), "\n")
+cat("In prox but not groom:", setdiff(codes_prox, codes_groom), "\n")
+
+# 2. Zero counts in each predictor (proportion == 0 means the mother was
+#    observed but never seen grooming/close to the son - different from
+#    NA, which means no observation data existed at all for that dyad)
+cat("\n--- mom_groom_proportion ---\n")
+cat("N non-NA (pre-filter, full emigrants_full):",
+    sum(!is.na(emigrants_full$mom_groom_proportion)), "\n")
+cat("N exactly 0:", sum(emigrants_full$mom_groom_proportion == 0, na.rm = TRUE), "\n")
+cat("N NaN (0/0, i.e. mom had grooming data but zero total groom days):",
+    sum(is.nan(emigrants_full$mom_groom_proportion)), "\n")
+
+cat("\n--- mom_prox_proportion ---\n")
+cat("N non-NA (pre-filter, full emigrants_full):",
+    sum(!is.na(emigrants_full$mom_prox_proportion)), "\n")
+cat("N exactly 0:", sum(emigrants_full$mom_prox_proportion == 0, na.rm = TRUE), "\n")
+cat("N NaN (0/0, i.e. mom had scan data but zero total scans):",
+    sum(is.nan(emigrants_full$mom_prox_proportion)), "\n")
+
+# 3. Zero counts within the actually-filtered sem_data (post sem_data build)
+cat("\n--- Within sem_data_groom (n =", nrow(sem_data_groom), ") ---\n")
+cat("N exactly 0:", sum(sem_data_groom$mom_groom_proportion == 0), "\n")
+print(sem_data_groom$Code[sem_data_groom$mom_groom_proportion == 0])
+
+cat("\n--- Within sem_data_prox (n =", nrow(sem_data_prox), ") ---\n")
+cat("N exactly 0:", sum(sem_data_prox$mom_prox_proportion == 0), "\n")
+print(sem_data_prox$Code[sem_data_prox$mom_prox_proportion == 0])
+
+# 4. Cross-tab: for individuals in both samples, are the two proportions
+#    correlated or suspiciously identical (e.g. accidental copy-paste of
+#    one column into the other upstream)?
+both <- inner_join(
+  sem_data_groom %>% select(Code, mom_groom_proportion),
+  sem_data_prox  %>% select(Code, mom_prox_proportion),
+  by = "Code"
+)
+cat("\n--- Cross-check ---\n")
+cat("N individuals in both:", nrow(both), "\n")
+cat("Correlation (groom vs prox proportion):",
+    round(cor(both$mom_groom_proportion, both$mom_prox_proportion, use = "complete.obs"), 3), "\n")
+cat("N rows where the two proportions are identical:",
+    sum(both$mom_groom_proportion == both$mom_prox_proportion), "\n")
+print(head(both, 10))
+```
+
+# 3. Mediator specifications (shared across both predictor pipelines)
+
+```{r mediator-specs}
+mediator_specs <- list(
+  list(name = "prox_strength",      posteriors = prox_posteriors, field = "prox_strength"),
+  list(name = "prox_degree",        posteriors = prox_posteriors, field = "prox_degree"),
+  list(name = "groom_out_strength", posteriors = groom_posteriors, field = "groom_out_strength"),
+  list(name = "groom_in_strength",  posteriors = groom_posteriors, field = "groom_in_strength"),
+  list(name = "groom_out_degree",   posteriors = groom_posteriors, field = "groom_out_degree"),
+  list(name = "groom_in_degree",    posteriors = groom_posteriors, field = "groom_in_degree")
+)
+```
+
+# 4. Summary helper
+
+```{r summarize-network-draws-function}
+summarize_network_draws <- function(estimates) {
+  tibble(
+    estimate_mean   = mean(estimates),
+    estimate_median = median(estimates),
+    network_q025    = quantile(estimates, 0.025, names = FALSE),
+    network_q975    = quantile(estimates, 0.975, names = FALSE),
+    prop_positive   = mean(estimates > 0),
+    prop_negative   = mean(estimates < 0)
+  )
+}
+```
+
+# 5. Convergence check helper (uses the VALIDATED reliable method)
+
+```{r convergence-check-function}
+check_joint_convergence <- function(fit, rhat_threshold = 1.01, ess_threshold = 400) {
+  summ <- summarise_draws(as_draws_df(fit))
+  bad_rhat <- summ %>% filter(rhat > rhat_threshold)
+  bad_ess  <- summ %>% filter(ess_bulk < ess_threshold | ess_tail < ess_threshold)
+
+  ok <- nrow(bad_rhat) == 0 && nrow(bad_ess) == 0
+
+  if (!ok) {
+    cat("    CONVERGENCE WARNING:\n")
+    if (nrow(bad_rhat) > 0) {
+      cat("    Parameters with Rhat >", rhat_threshold, ":\n")
+      print(bad_rhat %>% select(variable, rhat))
+    }
+    if (nrow(bad_ess) > 0) {
+      cat("    Parameters with ESS <", ess_threshold, ":\n")
+      print(bad_ess %>% select(variable, ess_bulk, ess_tail))
+    }
+  }
+
+  list(ok = ok, max_rhat = max(summ$rhat, na.rm = TRUE),
+       min_ess = min(c(summ$ess_bulk, summ$ess_tail), na.rm = TRUE))
+}
+```
+
+# 6. Joint Bayesian mediation function (compile once, update() per draw)
+
+Same internal logic as script 5v5's `run_bison_mediation_bayesian_joint`,
+generalized only to accept which predictor column/label/sem_data to use
+for a given pipeline run - the predictor itself is fixed for the
+duration of a full run, exactly as in script 5v5 (it is not looped
+inside this function).
+
+```{r joint-bayesian-mediation-function}
+run_investment_mediation_bayesian_joint <- function(sem_data, predictor_col, predictor_label, spec,
+                                                      num_draws, chains = 2, iter = 2000, warmup = 1000,
+                                                      adapt_delta = 0.95) {
+
+  cat("Running JOINT BAYESIAN mediation:", predictor_label, "->", spec$name, "\n")
+
+  males_with_posteriors <- sem_data$Code[sem_data$Code %in% names(spec$posteriors)]
+  dat <- sem_data %>% filter(Code %in% males_with_posteriors)
+
+  if (nrow(dat) < 10) {
+    cat("  Too few males with posteriors:", nrow(dat), "— skipping\n")
+    return(NULL)
+  }
+  cat("  Males with all data:", nrow(dat), "\n")
+
+  first_post <- spec$posteriors[[males_with_posteriors[1]]][[spec$field]]
+  actual_draws <- length(first_post)
+  num_draws <- min(num_draws, actual_draws)
+
+  mediator_point_estimates <- sapply(dat$Code, function(id) {
+    mean(spec$posteriors[[id]][[spec$field]][1:num_draws])
+  })
+  mediator_center <- mean(mediator_point_estimates)
+  mediator_scale   <- sd(mediator_point_estimates)
+
+  build_draw_data <- function(k) {
+    dat_k <- dat
+    dat_k$mediator <- sapply(dat_k$Code, function(id) spec$posteriors[[id]][[spec$field]][k])
+    dat_k$predictor_z <- scale(dat_k[[predictor_col]])[, 1]
+    dat_k$male_elo_z  <- scale(dat_k$elo_one_year_male_male)[, 1]
+    dat_k$mediator_z  <- (dat_k$mediator - mediator_center) / mediator_scale
+    dat_k
+  }
+
+  dat_1 <- build_draw_data(1)
+
+  # ── Validated joint model structure: heteroscedastic sigma ~ obs_weight
+  # in both equations, NO residual correlation (not well identified at
+  # this n - see script 5v5 for validation testing details) ──────────────
+  bf_mediator <- bf(mediator_z ~ predictor_z, sigma ~ obs_weight)
+  bf_outcome  <- bf(male_elo_z ~ mediator_z + predictor_z, sigma ~ obs_weight)
+
+  cat("  Compiling joint Stan model (draw 1)...\n")
+  t0 <- Sys.time()
+
+  fit_base <- brm(
+    bf_mediator + bf_outcome + set_rescor(FALSE),
+    data = dat_1, family = gaussian(),
+    chains = chains, iter = iter, warmup = warmup,
+    seed = 1, refresh = 0, silent = 2,
+    control = list(adapt_delta = adapt_delta)
+  )
+
+  compile_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  cat("  Compilation + first fit took", round(compile_time, 1), "seconds\n")
+
+  # Check convergence on draw 1 before proceeding - if this fails, no
+  # point continuing to 1,000 more draws with the same problem
+  conv1 <- check_joint_convergence(fit_base)
+  if (!conv1$ok) {
+    cat("  WARNING: draw 1 did not converge cleanly (max Rhat =",
+        round(conv1$max_rhat, 4), ", min ESS =", round(conv1$min_ess, 1), ") - inspect before proceeding\n")
+  }
+
+  a_all <- numeric(0); b_all <- numeric(0); c_all <- numeric(0); ind_all <- numeric(0)
+
+  for (k in 1:num_draws) {
+
+    dat_k <- if (k == 1) dat_1 else build_draw_data(k)
+
+    fit_k <- if (k == 1) fit_base else update(fit_base, newdata = dat_k, recompile = FALSE, refresh = 0, silent = 2)
+
+    post_k <- as_draws_df(fit_k)
+
+    a_post   <- post_k$b_mediatorz_predictor_z
+    b_post   <- post_k$b_maleeloz_mediator_z
+    c_post   <- post_k$b_maleeloz_predictor_z
+    ind_post <- a_post * b_post   # genuinely paired within-draw, from one joint posterior
+
+    a_all   <- c(a_all, a_post)
+    b_all   <- c(b_all, b_post)
+    c_all   <- c(c_all, c_post)
+    ind_all <- c(ind_all, ind_post)
+  }
+
+  results <- bind_rows(
+    summarize_network_draws(a_all)   %>% mutate(path = "a (investment -> mediator)"),
+    summarize_network_draws(b_all)   %>% mutate(path = "b (mediator -> male elo)"),
+    summarize_network_draws(c_all)   %>% mutate(path = "c' (investment -> male elo, direct)"),
+    summarize_network_draws(ind_all) %>% mutate(path = "indirect (a * b)")
+  ) %>%
+    mutate(predictor = predictor_label, mediator = spec$name, n = nrow(dat),
+           num_draws = num_draws, .before = 1)
+
+  cat("\n  === Joint Bayesian results:", predictor_label, "->", spec$name,
+      "(n =", nrow(dat), ",", num_draws, "network draws) ===\n")
+  for (j in 1:nrow(results)) {
+    cat(sprintf("  %-35s posterior mean = %6.3f  95%% interval [%6.3f, %6.3f]  %4.1f%% pos\n",
+                results$path[j], results$estimate_mean[j],
+                results$network_q025[j], results$network_q975[j],
+                results$prop_positive[j] * 100))
+  }
+  cat("\n")
+
+  list(
+    summary = results,
+    pooled_posterior = tibble(a = a_all, b = b_all, c_prime = c_all, indirect = ind_all),
+    draw1_convergence = conv1
+  )
+}
+```
+
+# 7. TEST FIRST: grooming investment, one mediator, small number of draws
+
+```{r test-small-run-groom, eval=FALSE}
+test_spec <- mediator_specs[[5]]  # groom_out_degree - matches script 5v5's validated test
+
+t0 <- Sys.time()
+test_out_groom <- run_investment_mediation_bayesian_joint(
+  sem_data_groom, "mom_groom_proportion", "Maternal grooming investment", test_spec,
+  num_draws = 5, chains = 2, iter = 2000, warmup = 1000
+)
+total_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+cat("\n=== TIMING TEST (grooming) ===\n")
+cat("Total time for 5 draws:", round(total_time, 1), "seconds\n")
+cat("Draw 1 convergence: max Rhat =", round(test_out_groom$draw1_convergence$max_rhat, 4),
+    ", min ESS =", round(test_out_groom$draw1_convergence$min_ess, 1), "\n")
+
+print(as.data.frame(test_out_groom$summary), row.names = FALSE)
+```
+
+# 8. FULL RUN — maternal grooming investment (only after confirming timing + convergence above)
+
+```{r run-full-bayesian-groom, eval=T}
+all_results_groom <- list()
+all_pooled_groom   <- list()
+
+for (spec in mediator_specs) {
+
+  cat("\n>>> Starting grooming ->", spec$name, "at", format(Sys.time()), "\n")
+
+  out <- tryCatch(
+    run_investment_mediation_bayesian_joint(
+      sem_data_groom, "mom_groom_proportion", "Maternal grooming investment", spec,
+      num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+    ),
+    error = function(e) {
+      cat("  ERROR for grooming ->", spec$name, ":", e$message, "\n")
+      NULL
+    }
+  )
+
+  if (!is.null(out)) {
+    all_results_groom[[spec$name]] <- out$summary
+    all_pooled_groom[[spec$name]]  <- out$pooled_posterior
+
+    tryCatch({
+      saveRDS(all_results_groom,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_mediation_bayesian_groom_PARTIAL.rds")
+      saveRDS(all_pooled_groom,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_pooled_posteriors_bayesian_groom_PARTIAL.rds")
+      cat("  Saved progress after grooming ->", spec$name, "\n")
+    }, error = function(e) {
+      cat("  WARNING: save failed after grooming ->", spec$name, "-", e$message, "\n")
+    })
+  }
+}
+```
+
+# 9. TEST FIRST: proximity investment, one mediator, small number of draws
+
+```{r test-small-run-prox, eval=FALSE}
+test_spec <- mediator_specs[[5]]  # groom_out_degree
+
+t0 <- Sys.time()
+test_out_prox <- run_investment_mediation_bayesian_joint(
+  sem_data_prox, "mom_prox_proportion", "Maternal proximity investment", test_spec,
+  num_draws = 5, chains = 2, iter = 2000, warmup = 1000
+)
+total_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+cat("\n=== TIMING TEST (proximity) ===\n")
+cat("Total time for 5 draws:", round(total_time, 1), "seconds\n")
+cat("Draw 1 convergence: max Rhat =", round(test_out_prox$draw1_convergence$max_rhat, 4),
+    ", min ESS =", round(test_out_prox$draw1_convergence$min_ess, 1), "\n")
+
+print(as.data.frame(test_out_prox$summary), row.names = FALSE)
+```
+
+# 10. FULL RUN — maternal proximity investment (only after confirming timing + convergence above)
+
+```{r run-full-bayesian-prox, eval=T}
+all_results_prox <- list()
+all_pooled_prox   <- list()
+
+for (spec in mediator_specs) {
+
+  cat("\n>>> Starting proximity ->", spec$name, "at", format(Sys.time()), "\n")
+
+  out <- tryCatch(
+    run_investment_mediation_bayesian_joint(
+      sem_data_prox, "mom_prox_proportion", "Maternal proximity investment", spec,
+      num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+    ),
+    error = function(e) {
+      cat("  ERROR for proximity ->", spec$name, ":", e$message, "\n")
+      NULL
+    }
+  )
+
+  if (!is.null(out)) {
+    all_results_prox[[spec$name]] <- out$summary
+    all_pooled_prox[[spec$name]]  <- out$pooled_posterior
+
+    tryCatch({
+      saveRDS(all_results_prox,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_mediation_bayesian_prox_PARTIAL.rds")
+      saveRDS(all_pooled_prox,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_pooled_posteriors_bayesian_prox_PARTIAL.rds")
+      cat("  Saved progress after proximity ->", spec$name, "\n")
+    }, error = function(e) {
+      cat("  WARNING: save failed after proximity ->", spec$name, "-", e$message, "\n")
+    })
+  }
+}
+```
+
+# 11. Combine both predictor pipelines into the final combined output
+
+Matches script 7's original final output files (single combined CSV/RDS
+across both predictors), now built from the two sequential
+script-5-style full runs above rather than a single nested loop.
+
+```{r combine-and-save-final, eval=T}
+all_results_bayes <- c(
+  setNames(all_results_groom, paste("Maternal grooming investment", names(all_results_groom), sep = " -> ")),
+  setNames(all_results_prox,  paste("Maternal proximity investment", names(all_results_prox),  sep = " -> "))
+)
+all_pooled_bayes <- c(
+  setNames(all_pooled_groom, paste("Maternal grooming investment", names(all_pooled_groom), sep = " -> ")),
+  setNames(all_pooled_prox,  paste("Maternal proximity investment", names(all_pooled_prox),  sep = " -> "))
+)
+
+full_summary_bayes <- bind_rows(all_results_bayes)
+
+tryCatch({
+  write.csv(full_summary_bayes,
+            "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_mediation_bayesian.csv",
+            row.names = FALSE)
+  saveRDS(all_pooled_bayes,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_pooled_posteriors_bayesian.rds")
+  cat("Done. Final combined results saved.\n")
+}, error = function(e) {
+  cat("WARNING: final save failed -", e$message, "\n")
+})
+
+print(as.data.frame(full_summary_bayes), row.names = FALSE)
+```
+
+```{r}
+prox_posteriors <- readRDS(file.path(data_dir, "prox_posteriors.rds"))
+mediator_specs_patch <- list(
+  list(name = "prox_degree", posteriors = prox_posteriors, field = "prox_degree")
+)
+
+all_results_patch6 <- list()
+all_pooled_patch6  <- list()
+
+out6_groom <- tryCatch(
+  run_investment_mediation_bayesian_joint(
+    sem_data_groom, "mom_groom_proportion", "Maternal grooming investment",
+    mediator_specs_patch[[1]], num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+  ), error = function(e) { cat("  ERROR (groom):", e$message, "\n"); NULL }
+)
+if (!is.null(out6_groom)) {
+  key <- "Maternal grooming investment -> prox_degree"
+  all_results_patch6[[key]] <- out6_groom$summary
+  all_pooled_patch6[[key]]  <- out6_groom$pooled_posterior
+}
+
+out6_prox <- tryCatch(
+  run_investment_mediation_bayesian_joint(
+    sem_data_prox, "mom_prox_proportion", "Maternal proximity investment",
+    mediator_specs_patch[[1]], num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+  ), error = function(e) { cat("  ERROR (prox):", e$message, "\n"); NULL }
+)
+if (!is.null(out6_prox)) {
+  key <- "Maternal proximity investment -> prox_degree"
+  all_results_patch6[[key]] <- out6_prox$summary
+  all_pooled_patch6[[key]]  <- out6_prox$pooled_posterior
+}
+
+existing_summary6 <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_mediation_bayesian.csv")
+existing_pooled6  <- readRDS("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_pooled_posteriors_bayesian.rds")
+
+file.copy("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_mediation_bayesian.csv",
+          paste0("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_mediation_bayesian_backup_",
+                 format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"), overwrite = FALSE)
+
+updated_summary6 <- bind_rows(existing_summary6 %>% filter(mediator != "prox_degree"),
+                              bind_rows(all_results_patch6))
+stale_keys6 <- grep("-> prox_degree$", names(existing_pooled6), value = TRUE)
+updated_pooled6 <- c(existing_pooled6[setdiff(names(existing_pooled6), stale_keys6)], all_pooled_patch6)
+
+write.csv(updated_summary6,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_mediation_bayesian.csv",
+          row.names = FALSE)
+saveRDS(updated_pooled6,
+        "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/investment_pooled_posteriors_bayesian.rds")
+cat("Script 6: prox_degree patched for both predictors.\n")
+
+```
+

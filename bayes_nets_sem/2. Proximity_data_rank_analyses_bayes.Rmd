@@ -1,0 +1,419 @@
+---
+title: "Proximity Network Metrics — Immigrant Males"
+author: "Alba Motes Rodrigo"
+date: "2025-09-10"
+output: html_document
+---
+
+# Terminal access (legacy, no longer needed)
+
+Previously, the bisonR package required a conda environment. This is no longer
+necessary — we bypass bisonR's broken `draw_edgelist_samples()` and sample
+directly from the Beta posterior with `rbeta()`.
+
+```
+# Legacy instructions (kept for reference):
+mamba activate bisonR
+cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Analyses/scripts_josieway_conflict_calc_bayes_nets_sem
+Rscript run_proximity_with_posteriors.R
+```
+
+# Setup
+
+```{r setup, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(igraph)
+library(tibble)
+library(purrr)
+
+emigrants <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/All_potential_immigrants_Josie_version.csv")
+```
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# Scan data preprocessing (raw scan.csv -> filtered, scan-numbered dataset)
+# Replaces reading the static scans_for_bison.csv directly, so this
+# pipeline always rebuilds from the current raw scan data when re-run.
+# ══════════════════════════════════════════════════════════════════════
+
+library(lubridate)
+library(dplyr)
+
+# ── Step 1: load raw scans, clean dates and blank individuals ──────────
+scans_raw<- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scan.csv",
+  header = TRUE, sep = ",", stringsAsFactors = FALSE, check.names = FALSE
+)
+
+scans_raw$date <- as.Date(scans_raw$date)
+scans_raw<- scans_raw%>% filter(!is.na(date))
+scans_raw$year <- year(scans_raw$date)
+
+scans_raw<- scans_raw%>%
+  filter(!is.na(idindividual1), idindividual1 != "")
+
+# Normalize ID casing/whitespace - matches emigrants_full$Code convention
+scans_raw$idindividual1 <- tolower(trimws(as.character(scans_raw$idindividual1)))
+
+# Also normalize any proximity-partner columns used downstream
+prox_cols <- c("ind1m", "indarmlength", "ind2m", "ind5m", "ind10m")
+for (col in prox_cols) {
+  if (col %in% names(scans_raw)) {
+    scans_raw[[col]] <- tolower(trimws(as.character(scans_raw[[col]])))
+  }
+}
+
+# ── Step 2: within a day, keep only scans of the same individual at
+# least 20 minutes apart ────────────────────────────────────────────────
+filter_independent_scans <- function(data, min_interval_minutes = 20) {
+  data <- data %>%
+    mutate(
+      time_minutes = hour(hms(time)) * 60 + minute(hms(time)),
+      row_id = row_number()
+    ) %>%
+    arrange(date, idindividual1, time_minutes)
+
+  data <- data %>%
+    group_by(date, idindividual1) %>%
+    mutate(
+      time_diff = c(Inf, diff(time_minutes)),
+      keep = cumsum(time_diff >= min_interval_minutes | time_diff == Inf) >
+             lag(cumsum(time_diff >= min_interval_minutes | time_diff == Inf), default = 0)
+    ) %>%
+    filter(keep) %>%
+    dplyr::select(-time_minutes, -row_id, -time_diff, -keep) %>%
+    ungroup()
+
+  data
+}
+
+scans_ivp_filtered <- filter_independent_scans(scans_raw, min_interval_minutes = 20)
+
+write.csv(scans_ivp_filtered,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scans_ivp_20minfiltered.csv",
+          row.names = FALSE)
+
+# ── Step 3: assign scan numbers / scan IDs ──────────────────────────────
+add_scan_numbers <- function(scan_filtered) {
+
+  scan_filtered$datetime <- as.POSIXct(paste(scan_filtered$date, scan_filtered$time),
+                                        format = "%Y-%m-%d %H:%M:%S")
+  scan_filtered <- scan_filtered[order(scan_filtered$group, scan_filtered$date, scan_filtered$datetime), ]
+
+  scan_filtered$scan_number <- NA
+  scan_filtered$scan_id <- NA
+
+  unique_combinations <- unique(scan_filtered[, c("group", "date")])
+
+  for (i in 1:nrow(unique_combinations)) {
+    current_group <- unique_combinations$group[i]
+    current_date  <- unique_combinations$date[i]
+
+    subset_indices <- which(scan_filtered$group == current_group & scan_filtered$date == current_date)
+    subset_data <- scan_filtered[subset_indices, ]
+
+    current_scan <- 1
+    subset_data$scan_number[1] <- current_scan
+    last_observation_time <- subset_data$datetime[1]
+    individuals_in_current_scan <- subset_data$idindividual1[1]
+
+    if (nrow(subset_data) > 1) {
+      for (j in 2:nrow(subset_data)) {
+
+        time_diff <- as.numeric(difftime(subset_data$datetime[j], last_observation_time, units = "mins"))
+        current_individual <- subset_data$idindividual1[j]
+
+        start_new_scan <- FALSE
+        if (time_diff > 15) start_new_scan <- TRUE
+        if (current_individual %in% individuals_in_current_scan) start_new_scan <- TRUE
+
+        if (start_new_scan) {
+          current_scan <- current_scan + 1
+          individuals_in_current_scan <- current_individual
+        } else {
+          individuals_in_current_scan <- c(individuals_in_current_scan, current_individual)
+        }
+
+        last_observation_time <- subset_data$datetime[j]
+        subset_data$scan_number[j] <- current_scan
+      }
+    }
+
+    subset_data$scan_id <- paste0(subset_data$scan_number, "_", subset_data$date, "_", subset_data$group)
+
+    scan_filtered[subset_indices, "scan_number"] <- subset_data$scan_number
+    scan_filtered[subset_indices, "scan_id"] <- subset_data$scan_id
+  }
+
+  cat("Scan numbering complete:\n")
+  cat("Total observations:", nrow(scan_filtered), "\n")
+  cat("Total unique scan IDs:", length(unique(scan_filtered$scan_id)), "\n")
+
+  scan_filtered
+}
+
+scans_ivp_filtered <- add_scan_numbers(scans_ivp_filtered)
+
+write.csv(scans_ivp_filtered,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scanswithid_ivp_20minfiltered.csv",
+          row.names = FALSE)
+
+# ── Step 4: this is now the `scans` object used by the rest of the script ──
+scans <- scans_ivp_filtered
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK",
+                          "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing" = "CR",
+                          "IFamily" = "IF")
+
+scans$group_Abbreviation <- group_abbreviations[scans$group]
+
+write.csv(scans,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scans_for_bison.csv",
+          row.names = FALSE)
+
+cat("\nFinal scans object (saved as scans_for_bison.csv): ", nrow(scans), "rows,",
+    length(unique(scans$scan_id)), "unique scan IDs\n")
+```
+SCANS_FOR_BISON.CSV IS THE SAME AS THE scanswithid_ivp_20minfiltered.CSV
+
+#Load script that extracts the scans at 1m and arm length and makes the edgelists
+```{r}
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Analyses/scan_extraction_1mandarm.R")
+```
+
+# Data exploration: distance categories by year
+
+```{r distance-table}
+distance_year_table <- scans %>%
+  filter(!is.na(distances_filled) & distances_filled != "") %>%
+  separate_rows(distances_filled, sep = ";") %>%
+  mutate(distance = trimws(distances_filled)) %>%
+  group_by(year, distance) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  arrange(year, distance)
+
+print(distance_year_table)
+
+distance_pivot <- distance_year_table %>%
+  pivot_wider(names_from = year, values_from = count, values_fill = 0) %>%
+  arrange(distance)
+
+distance_pivot
+```
+
+# Scan selection logic
+
+The function `extract_proximity_pairs()` (sourced from
+`scan_extraction_1mandarm.R`) selects proximity interactions using a
+year-dependent hierarchy:
+
+**Before 2022:**
+
+1. If `ind1m` is filled → use it and STOP
+2. If `ind1m` empty → check if `distancenna = "1m"` or `distancennj = "1m"`
+   - If `distancenna = "1m"` → use `nnadult`
+   - If `distancennj = "1m"` → use `nnjuvenile`
+3. Only if ALL three are empty: check `indarmlength`, then `distancenna = "Arm length"` or `distancennj = "Arm length"`
+
+**From 2022 onwards:** Same hierarchy but flipped — arm length is prioritised first:
+
+1. If `indarmlength` is filled → use it and STOP
+2. If `indarmlength` empty → check `distancenna = "Arm length"` or `distancennj = "Arm length"`
+3. Only if all arm length sources are empty → check `ind1m` and 1m distances
+
+# Bayesian network metric estimation
+
+## Method
+
+For each immigrant male, we extract all group scans collected between his
+immigration date and 365 days post-immigration. We build a proximity network
+including all group members observed during that period.
+
+Edge weights are estimated using conjugate Bayesian inference. For each dyad,
+the posterior edge weight is sampled from:
+
+$$\text{Beta}(0.1 + \text{count}, \; 0.1 + \text{duration} - \text{count})$$
+
+where `count` is the number of scans in which both individuals were observed
+in proximity (co-occurrence scans) and `duration` is the SRI denominator
+(`scans_node_1 + scans_node_2 - count`). The Beta(0.1, 0.1) prior is weakly
+informative and matches the prior used in bisonR's `binary_conjugate` model.
+
+We draw 1000 posterior network instantiations and compute node-level metrics
+on each, yielding posterior distributions for each metric.
+
+## Metrics
+
+- **Degree**: number of distinct individuals the focal male was observed in
+  proximity with. Estimated with uncertainty from the Bayesian edge weight model.
+
+- **Strength**: sum of all Bayesian edge weights connecting the focal male to
+  his associates. Reflects both number of associates and strength of
+  association with each.
+
+- **Strength association** (classic): frequentist counterpart — sum of SRI
+  values across all dyads involving the focal male. Reported as a robustness
+  check without uncertainty.
+
+- **Eigenvector centrality**: measures the focal male's influence by accounting
+  for how well-connected his associates are. Computed from the Bayesian
+  posterior on each network draw.
+
+Full posterior draws (1000 per male per metric) are saved as `.rds` files for
+use in downstream BISoN-style analyses (e.g., propagating uncertainty through
+SEM models). It is called prox_posteriors.rds
+
+A file called network_mets_proximity_bayes.csv is saved where the prox_results$summaries are stored.
+
+# Run the analysis
+
+```{r run-proximity}
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Analyses/bayes_nets_sem/bison_prox_net_script.R")
+```
+
+144 males with posteriors saved.
+
+# Load results
+
+```{r load-results}
+network_proximity_bayes <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/network_mets_prox_bayes.csv"
+)
+
+str(network_proximity_bayes)
+```
+
+# Column descriptions
+
+| Column | Description |
+|--------|-------------|
+| `Code` | Individual male's ID code |
+| `group` | Immigration group (`ImmigrationGp1`) |
+| `start_date` | Date of immigration |
+| `end_date` | Immigration date + 365 days |
+| `degree_mean` | Mean number of non-zero edges across 1000 posterior draws |
+| `degree_lower` / `degree_upper` | 95% credible interval (2.5th–97.5th percentiles) |
+| `strength_mean` | Mean sum of edge weights across 1000 posterior draws |
+| `strength_lower` / `strength_upper` | 95% credible interval |
+| `strength_assoc` | Classic SRI-based strength (point estimate, no uncertainty) |
+| `eigenvector_mean` | Mean eigenvector centrality across 1000 posterior draws |
+| `eigenvector_lower` / `eigenvector_upper` | 95% credible interval |
+| `n_dyads` | Total number of dyads in the network |
+| `n_scans` | Number of scans in which this male was observed |
+
+# Summary
+
+```{r summary}
+cat("Males with proximity metrics:", nrow(network_proximity_bayes), "\n\n") 
+
+summary(network_proximity_bayes %>%
+  select(degree_mean, strength_mean, strength_assoc, n_scans))
+```
+
+#Check of whether metrics calculated in different years are comparable.
+```{r}
+overlap_years <- 2016:2021
+
+scans_overlap <- scans %>%
+  mutate(date = as.Date(date)) %>%
+  filter(!is.na(date), lubridate::year(date) %in% overlap_years)
+
+# ── Force single-distance extraction (mirrors extract_proximity_pairs logic) ──
+extract_1m_only <- function(scan_data) {
+  scan_data %>%
+    mutate(interaction_partner = case_when(
+      !is.na(ind1m) & ind1m != ""  ~ ind1m,
+      distancenna == "1m"           ~ nnadult,
+      distancennj == "1m"           ~ nnjuvenile,
+      TRUE                          ~ NA_character_
+    ))
+}
+
+extract_arm_only <- function(scan_data) {
+  scan_data %>%
+    mutate(interaction_partner = case_when(
+      !is.na(indarmlength) & indarmlength != "" ~ indarmlength,
+      distancenna == "Arm length"                 ~ nnadult,
+      distancennj == "Arm length"                 ~ nnjuvenile,
+      TRUE                                        ~ NA_character_
+    ))
+}
+
+prox_1m  <- extract_1m_only(scans_overlap)
+prox_arm <- extract_arm_only(scans_overlap)
+
+#Build a simple SRI-based dyadic network + node metrics for each distance type
+build_network_metrics <- function(scan_subset) {
+  
+  scan_subset <- scan_subset %>%
+    filter(!is.na(idindividual1) & idindividual1 != "")
+  
+  from_focal <- scan_subset %>%
+    filter(!is.na(idindividual1) & idindividual1 != "") %>%
+    distinct(idindividual1, scan_id) %>%
+    rename(individual = idindividual1)
+  
+  from_partner <- scan_subset %>%
+    filter(!is.na(interaction_partner) & interaction_partner != "") %>%
+    distinct(interaction_partner, scan_id) %>%
+    rename(individual = interaction_partner)
+  
+  individual_scan_counts <- bind_rows(from_focal, from_partner) %>%
+    distinct() %>%
+    group_by(individual) %>%
+    summarise(scans_sampled = n_distinct(scan_id), .groups = "drop")
+  
+  dyadic_data <- scan_subset %>%
+    filter(!is.na(interaction_partner) & interaction_partner != "") %>%
+    mutate(
+      node_1 = pmin(idindividual1, interaction_partner),
+      node_2 = pmax(idindividual1, interaction_partner)
+    ) %>%
+    filter(node_1 != node_2) %>%
+    group_by(node_1, node_2) %>%
+    summarise(event = n_distinct(scan_id), .groups = "drop") %>%
+    left_join(individual_scan_counts, by = c("node_1" = "individual")) %>%
+    rename(scans_node_1 = scans_sampled) %>%
+    left_join(individual_scan_counts, by = c("node_2" = "individual")) %>%
+    rename(scans_node_2 = scans_sampled) %>%
+    mutate(
+      duration = scans_node_1 + scans_node_2 - event,
+      sri      = event / duration
+    )
+  
+  g <- igraph::graph_from_data_frame(
+    dyadic_data %>% dplyr::select(node_1, node_2, weight = sri),
+    directed = FALSE
+  )
+  
+  tibble(
+    id       = igraph::V(g)$name,
+    degree   = igraph::degree(g),
+    strength = igraph::strength(g, weights = igraph::E(g)$weight),
+    eigen    = igraph::eigen_centrality(g, weights = igraph::E(g)$weight)$vector
+  )
+}
+metrics_1m  <- build_network_metrics(prox_1m)  %>% rename_with(~paste0(.x, "_1m"),  -id)
+metrics_arm <- build_network_metrics(prox_arm) %>% rename_with(~paste0(.x, "_arm"), -id)
+
+#Restrict to individuals with metrics in both, then correlate:
+
+both_ids <- intersect(metrics_1m$id, metrics_arm$id)
+length(both_ids)
+
+comparison_full <- metrics_1m %>%
+  filter(id %in% both_ids) %>%
+  left_join(metrics_arm, by = "id")
+
+# full comparison (strongest evidence for reviewers)
+cor.test(comparison_full$degree_1m,   comparison_full$degree_arm,   method = "spearman")
+cor.test(comparison_full$strength_1m, comparison_full$strength_arm, method = "spearman") #rho= 0.76
+
+ggplot(comparison_full, aes(x = strength_1m, y = strength_arm)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue") +
+  labs(x = "Strength (1m-based network)", y = "Strength (arm-based network)",
+       title = "1m vs arm-length strength, 2016-2021 overlap") +
+  theme_minimal()
+```

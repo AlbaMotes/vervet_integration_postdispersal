@@ -1,0 +1,337 @@
+---
+title: "5. Maternal_rank_model_revised_v5_joint_bayesian"
+author: "Alba Motes Rodrigo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+Revises script 5v4 based on two validated critiques:
+
+  1. weights(obs_weight) in brms implements a FREQUENCY-type weight (as
+     if an observation with weight 0.25 contributes a quarter of a full
+     observation's likelihood), NOT a measurement-precision downweighting.
+     This is not what "the mother was only observed for part of the year,
+     so this individual's value is less reliable" actually means
+     statistically. FIXED: obs_weight now enters via sigma ~ obs_weight
+     (distributional/heteroscedastic regression) in BOTH equations,
+     directly modeling residual variance as a function of observation
+     completeness - a more faithful representation of the original intent.
+
+  2. Fitting mediator_z ~ maternal_elo_z and male_elo_z ~ mediator_z +
+     maternal_elo_z as two SEPARATE brm() calls and then multiplying their
+     independently-sampled posteriors (a_post * b_post) approximates
+     p(a|D1) x p(b|D2), not the genuine joint posterior p(a,b|D). FIXED:
+     both equations are now fit as ONE joint multivariate brms model
+     (bf_mediator + bf_outcome), so a, b, and c' are drawn together,
+     properly paired, from the same MCMC draws each iteration.
+
+VALIDATED MODEL STRUCTURE (tested on groom_out_degree, draw 1):
+  bf(mediator_z ~ maternal_elo_z, sigma ~ obs_weight) +
+  bf(male_elo_z ~ mediator_z + maternal_elo_z, sigma ~ obs_weight) +
+  set_rescor(FALSE)
+Residual correlation (set_rescor(TRUE)) was tested and NOT well identified
+at n=27 (very wide, uninformative CI) - dropped. Convergence with this
+exact structure: max Rhat = 1.003, all named-parameter ESS bulk/tail in
+the 900-1800 range (verified via summarise_draws(as_draws_df(fit)), which
+is the reliable diagnostic here - posterior::ess_bulk(as_draws_array(fit))
+returned spurious NA/near-zero values for this model and should NOT be
+used; always check convergence via summarise_draws(as_draws_df(fit)).
+
+```{r setup}
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(brms)
+library(posterior)
+```
+
+```{r load-data}
+emigrants_full <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/emigrants_full_merged.csv"
+)
+
+prox_posteriors <- readRDS(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/prox_posteriors.rds"
+)
+
+groom_posteriors <- readRDS(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/groom_posteriors.rds"
+)
+```
+
+# Compute observation weight (used as a sigma predictor, not a likelihood weight)
+
+```{r compute-weight}
+emigrants_full <- emigrants_full %>%
+  mutate(
+    DateImmigration1 = as.Date(DateImmigration1),
+    DepartureNatalGp = as.Date(DepartureNatalGp),
+    LastSeen1        = as.Date(LastSeen1),
+    start_date_effective = if_else(!is.na(DateImmigration1),
+                                    DateImmigration1,
+                                    DepartureNatalGp),
+    window_end       = start_date_effective + 365,
+    effective_end    = if_else(!is.na(LastSeen1) & LastSeen1 < window_end,
+                                LastSeen1, window_end),
+    days_present_first_year = pmin(as.numeric(effective_end - start_date_effective), 365),
+    obs_weight       = days_present_first_year / 365
+  )
+
+cat("Summary of resulting weight (now used as a sigma predictor):\n")
+summary(emigrants_full$obs_weight)
+```
+
+# Filter for males with all data available
+
+```{r filter}
+sem_data <- emigrants_full %>%
+  filter(!is.na(mother_avg_elo),
+         !is.na(elo_one_year_male_male),
+         !is.na(strength_mean),
+         !is.na(out_strength_mean),
+         !is.na(obs_weight))
+
+cat("Sample size for SEM:", nrow(sem_data), "\n")#33
+```
+
+# Mediator specifications
+
+```{r mediator-specs}
+mediator_specs <- list(
+  list(name = "prox_strength",      posteriors = prox_posteriors,  field = "prox_strength"),
+  list(name = "prox_degree",        posteriors = prox_posteriors,  field = "prox_degree"),
+  list(name = "groom_out_strength", posteriors = groom_posteriors, field = "groom_out_strength"),
+  list(name = "groom_in_strength",  posteriors = groom_posteriors, field = "groom_in_strength"),
+  list(name = "groom_out_degree",   posteriors = groom_posteriors, field = "groom_out_degree"),
+  list(name = "groom_in_degree",    posteriors = groom_posteriors, field = "groom_in_degree")
+)
+```
+
+# Summary helper
+
+```{r summarize-network-draws-function}
+summarize_network_draws <- function(estimates) {
+  tibble(
+    estimate_mean   = mean(estimates),
+    estimate_median = median(estimates),
+    network_q025    = quantile(estimates, 0.025, names = FALSE),
+    network_q975    = quantile(estimates, 0.975, names = FALSE),
+    prop_positive   = mean(estimates > 0),
+    prop_negative   = mean(estimates < 0)
+  )
+}
+```
+
+# Convergence check helper 
+
+```{r convergence-check-function}
+
+check_joint_convergence <- function(fit, rhat_threshold = 1.01, ess_threshold = 400) {
+  summ <- summarise_draws(as_draws_df(fit))
+  bad_rhat <- summ %>% filter(rhat > rhat_threshold)
+  bad_ess  <- summ %>% filter(ess_bulk < ess_threshold | ess_tail < ess_threshold)
+
+  ok <- nrow(bad_rhat) == 0 && nrow(bad_ess) == 0
+
+  if (!ok) {
+    cat("    CONVERGENCE WARNING:\n")
+    if (nrow(bad_rhat) > 0) {
+      cat("    Parameters with Rhat >", rhat_threshold, ":\n")
+      print(bad_rhat %>% select(variable, rhat))
+    }
+    if (nrow(bad_ess) > 0) {
+      cat("    Parameters with ESS <", ess_threshold, ":\n")
+      print(bad_ess %>% select(variable, ess_bulk, ess_tail))
+    }
+  }
+
+  list(ok = ok, max_rhat = max(summ$rhat, na.rm = TRUE), min_ess = min(c(summ$ess_bulk, summ$ess_tail), na.rm = TRUE))
+}
+```
+
+# Joint Bayesian mediation function (compile once, update() per draw)
+
+```{r joint-bayesian-mediation-function}
+run_bison_mediation_bayesian_joint <- function(sem_data, spec, num_draws,
+                                                chains = 2, iter = 2000, warmup = 1000,
+                                                adapt_delta = 0.95) {
+
+  cat("Running JOINT BAYESIAN mediation for:", spec$name, "\n")
+
+  males_with_posteriors <- sem_data$Code[sem_data$Code %in% names(spec$posteriors)]
+  dat <- sem_data %>% filter(Code %in% males_with_posteriors)
+
+  if (nrow(dat) < 10) {
+    cat("  Too few males with posteriors:", nrow(dat), "— skipping\n")
+    return(NULL)
+  }
+  cat("  Males with all data:", nrow(dat), "\n")
+
+  first_post <- spec$posteriors[[males_with_posteriors[1]]][[spec$field]]
+  actual_draws <- length(first_post)
+  num_draws <- min(num_draws, actual_draws)
+
+  mediator_point_estimates <- sapply(dat$Code, function(id) {
+    mean(spec$posteriors[[id]][[spec$field]][1:num_draws])
+  })
+  mediator_center <- mean(mediator_point_estimates)
+  mediator_scale   <- sd(mediator_point_estimates)
+
+  build_draw_data <- function(k) {
+    dat_k <- dat
+    dat_k$mediator <- sapply(dat_k$Code, function(id) spec$posteriors[[id]][[spec$field]][k])
+    dat_k$maternal_elo_z <- scale(dat_k$mother_avg_elo)[, 1]
+    dat_k$male_elo_z     <- scale(dat_k$elo_one_year_male_male)[, 1]
+    dat_k$mediator_z     <- (dat_k$mediator - mediator_center) / mediator_scale
+    dat_k
+  }
+
+  dat_1 <- build_draw_data(1)
+
+  # ── Validated joint model structure: heteroscedastic sigma ~ obs_weight
+  # in both equations, NO residual correlation (not well identified at
+  # this n - see overview note) ─────────────────────────────────────────
+  bf_mediator <- bf(mediator_z ~ maternal_elo_z, sigma ~ obs_weight)
+  bf_outcome  <- bf(male_elo_z ~ mediator_z + maternal_elo_z, sigma ~ obs_weight)
+
+  cat("  Compiling joint Stan model (draw 1)...\n")
+  t0 <- Sys.time()
+
+  fit_base <- brm(
+    bf_mediator + bf_outcome + set_rescor(FALSE),
+    data = dat_1, family = gaussian(),
+    chains = chains, iter = iter, warmup = warmup,
+    seed = 1, refresh = 0, silent = 2,
+    control = list(adapt_delta = adapt_delta)
+  )
+
+  compile_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  cat("  Compilation + first fit took", round(compile_time, 1), "seconds\n")
+
+  # Check convergence on draw 1 before proceeding - if this fails, no
+  # point continuing to 1,000 more draws with the same problem
+  conv1 <- check_joint_convergence(fit_base)
+  if (!conv1$ok) {
+    cat("  WARNING: draw 1 did not converge cleanly (max Rhat =",
+        round(conv1$max_rhat, 4), ", min ESS =", round(conv1$min_ess, 1), ") - inspect before proceeding\n")
+  }
+
+  a_all <- numeric(0); b_all <- numeric(0); c_all <- numeric(0); ind_all <- numeric(0)
+  n_convergence_failures <- 0
+
+  for (k in 1:num_draws) {
+
+    dat_k <- if (k == 1) dat_1 else build_draw_data(k)
+
+    fit_k <- if (k == 1) fit_base else update(fit_base, newdata = dat_k, recompile = FALSE, refresh = 0, silent = 2)
+
+    post_k <- as_draws_df(fit_k)
+
+    a_post   <- post_k$b_mediatorz_maternal_elo_z
+    b_post   <- post_k$b_maleeloz_mediator_z
+    c_post   <- post_k$b_maleeloz_maternal_elo_z
+    ind_post <- a_post * b_post   # NOW genuinely paired within-draw, from one joint posterior
+
+    a_all   <- c(a_all, a_post)
+    b_all   <- c(b_all, b_post)
+    c_all   <- c(c_all, c_post)
+    ind_all <- c(ind_all, ind_post)
+  }
+
+  results <- bind_rows(
+    summarize_network_draws(a_all)   %>% mutate(path = "a (maternal -> mediator)"),
+    summarize_network_draws(b_all)   %>% mutate(path = "b (mediator -> male elo)"),
+    summarize_network_draws(c_all)   %>% mutate(path = "c' (maternal -> male elo, direct)"),
+    summarize_network_draws(ind_all) %>% mutate(path = "indirect (a * b)")
+  ) %>%
+    mutate(mediator = spec$name, n = nrow(dat), num_draws = num_draws, .before = 1)
+
+  cat("\n  === Joint Bayesian results for", spec$name, "(n =", nrow(dat), ",", num_draws, "network draws) ===\n")
+  for (j in 1:nrow(results)) {
+    cat(sprintf("  %-35s posterior mean = %6.3f  95%% interval [%6.3f, %6.3f]  %4.1f%% pos\n",
+                results$path[j], results$estimate_mean[j],
+                results$network_q025[j], results$network_q975[j],
+                results$prop_positive[j] * 100))
+  }
+  cat("\n")
+
+  list(
+    summary = results,
+    pooled_posterior = tibble(a = a_all, b = b_all, c_prime = c_all, indirect = ind_all),
+    draw1_convergence = conv1
+  )
+}
+```
+
+# TEST FIRST: small number of draws, check timing AND convergence
+
+```{r test-small-run, eval=FALSE}
+test_spec <- mediator_specs[[5]]  # groom_out_degree - matches the validated test
+
+t0 <- Sys.time()
+test_out <- run_bison_mediation_bayesian_joint(
+  sem_data, test_spec,
+  num_draws = 5, chains = 2, iter = 2000, warmup = 1000
+)
+total_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+cat("\n=== TIMING TEST ===\n")
+cat("Total time for 5 draws:", round(total_time, 1), "seconds\n")
+cat("Draw 1 convergence: max Rhat =", round(test_out$draw1_convergence$max_rhat, 4),
+    ", min ESS =", round(test_out$draw1_convergence$min_ess, 1), "\n")
+
+print(as.data.frame(test_out$summary), row.names = FALSE)
+```
+
+# FULL RUN (only after confirming timing + convergence above)
+
+```{r run-full-bayesian, eval=T}
+all_results_bayes <- list()
+all_pooled_bayes   <- list()
+
+for (spec in mediator_specs) {
+
+  cat("\n>>> Starting", spec$name, "at", format(Sys.time()), "\n")
+
+  out <- tryCatch(
+    run_bison_mediation_bayesian_joint(sem_data, spec, num_draws = 1000,
+                                         chains = 2, iter = 2000, warmup = 1000),
+    error = function(e) {
+      cat("  ERROR for", spec$name, ":", e$message, "\n")
+      NULL
+    }
+  )
+
+  if (!is.null(out)) {
+    all_results_bayes[[spec$name]] <- out$summary
+    all_pooled_bayes[[spec$name]]  <- out$pooled_posterior
+
+    tryCatch({
+      saveRDS(all_results_bayes,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/rank_mediation_results_bayesian_joint_PARTIAL.rds")
+      saveRDS(all_pooled_bayes,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_pooled_posteriors_bayesian_joint_PARTIAL.rds")
+      cat("  Saved progress after", spec$name, "\n")
+    }, error = function(e) {
+      cat("  WARNING: save failed after", spec$name, "-", e$message, "\n")
+    })
+  }
+}
+
+full_summary_bayes <- bind_rows(all_results_bayes)
+
+tryCatch({
+  write.csv(full_summary_bayes,
+            "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/rank_mediation_results_bayesian_joint.csv",
+            row.names = FALSE)
+  saveRDS(all_pooled_bayes,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_pooled_posteriors_bayesian_joint.rds")
+  cat("Done. Final results saved.\n")
+}, error = function(e) {
+  cat("WARNING: final save failed -", e$message, "\n")
+})
+
+print(as.data.frame(full_summary_bayes), row.names = FALSE)
+```

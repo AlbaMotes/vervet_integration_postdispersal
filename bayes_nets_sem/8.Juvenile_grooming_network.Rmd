@@ -1,0 +1,540 @@
+---
+title: "10. Juvenile (pre-dispersal) grooming network metrics"
+author: "Alba Motes Rodrigo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+Computes each male's directed grooming network position during his OWN
+juvenile period (natal group, up to 1 year before `juvenile_period_end`),
+mirroring `bison_groom_net_script.R`'s post-dispersal version. Reuses
+`compute_directed_metrics_from_posterior()` unchanged — only the
+window/group selection differs, via a new
+`extract_male_grooming_metrics_juvenile()` wrapper.
+
+```{r setup, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(igraph)
+
+data_dir <- "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data"
+
+emigrants        <- read.csv(file.path(data_dir, "All_potential_immigrants_Josie_version.csv"))
+grooming_data    <- read.csv(file.path(data_dir, "grooming_data2010_2025.csv"))
+affiliative      <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/adlib/affiliative.csv")
+group_presence_matrices <- readRDS(file.path(data_dir, "group_presence_matrices.rds"))
+
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK",
+                         "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing" = "CR",
+                         "IFamily" = "IF")
+affiliative$group_Abbreviation <- group_abbreviations[affiliative$group]
+```
+
+# Build the juvenile window
+
+Same helper as script 9 — repeated here so this Rmd can run standalone.
+
+```{r build-juvenile-window}
+# window = DOB + 365 days (excludes infant year) through dispersal
+# (DateImmigration1, falling back to DepartureNatalGp) - full span,
+# not clipped to a fixed length. See script 9 for the same definition.
+build_juvenile_window <- function(emigrants) {
+  emigrants %>%
+    mutate(
+      DOB              = as.Date(DOB),
+      DateImmigration1 = as.Date(DateImmigration1),
+      DepartureNatalGp = as.Date(DepartureNatalGp),
+      natal_group      = BirthGp,
+      dispersal_date   = if_else(!is.na(DateImmigration1), DateImmigration1, DepartureNatalGp),
+      juvenile_window_start = DOB + 365,
+      juvenile_window_end   = dispersal_date
+    )
+}
+
+emigrants_juv <- build_juvenile_window(emigrants)
+
+# Guard against males who "dispersed" before turning 1 (invalid window)
+emigrants_juv <- emigrants_juv %>%
+  mutate(
+    juvenile_window_start = if_else(juvenile_window_start < juvenile_window_end,
+                                     juvenile_window_start, as.Date(NA)),
+    juvenile_window_end   = if_else(!is.na(juvenile_window_start), juvenile_window_end, as.Date(NA))
+  )
+
+cat("Males missing natal_group / window entirely:\n")
+emigrants_juv %>%
+  summarise(
+    n_total            = n(),
+    n_has_natal_group  = sum(!is.na(natal_group)),
+    n_has_window_start = sum(!is.na(juvenile_window_start)),
+    n_has_window_end   = sum(!is.na(juvenile_window_end))
+  ) %>% print()
+```
+
+# Helper: compute directed network metrics from Beta posterior samples
+
+Identical to `bison_groom_net_script.R` — reused unchanged.
+
+```{r compute-directed-metrics-function}
+compute_directed_metrics_from_posterior <- function(dyadic_data, all_nodes,
+                                                    num_draws = 1000,
+                                                    prior_a = 0.1, prior_b = 0.1,
+                                                    edge_thresh = 0.0001) {
+
+  n_dyads <- nrow(dyadic_data)
+  n_nodes <- length(all_nodes)
+
+  draw_mat <- matrix(NA, nrow = n_dyads, ncol = num_draws)
+  for (d in 1:n_dyads) {
+    draw_mat[d, ] <- rbeta(num_draws,
+                           prior_a + dyadic_data$event[d],
+                           prior_b + dyadic_data$duration[d] - dyadic_data$event[d])
+  }
+
+  in_strength_mat  <- matrix(NA, nrow = num_draws, ncol = n_nodes, dimnames = list(NULL, all_nodes))
+  out_strength_mat <- matrix(NA, nrow = num_draws, ncol = n_nodes, dimnames = list(NULL, all_nodes))
+  in_degree_mat    <- matrix(NA, nrow = num_draws, ncol = n_nodes, dimnames = list(NULL, all_nodes))
+  out_degree_mat   <- matrix(NA, nrow = num_draws, ncol = n_nodes, dimnames = list(NULL, all_nodes))
+  eigen_mat        <- matrix(NA, nrow = num_draws, ncol = n_nodes, dimnames = list(NULL, all_nodes))
+
+  from_node <- as.character(dyadic_data$groomer)
+  to_node   <- as.character(dyadic_data$groomee)
+
+  for (k in 1:num_draws) {
+
+    adj <- matrix(0, n_nodes, n_nodes, dimnames = list(all_nodes, all_nodes))
+    for (r in 1:n_dyads) {
+      w <- draw_mat[r, k]
+      if (w < edge_thresh) w <- 0
+      adj[from_node[r], to_node[r]] <- w
+    }
+
+    g <- igraph::graph_from_adjacency_matrix(adj, mode = "directed", weighted = TRUE)
+
+    in_strength_mat[k, ]  <- igraph::strength(g, mode = "in")
+    out_strength_mat[k, ] <- igraph::strength(g, mode = "out")
+    # Juvenile windows can span multiple years, so group membership turns
+    # over - median daily group size can be smaller than the cumulative
+    # network. Normalizing by n_nodes - 1 avoids that mismatch; degree can
+    # never exceed n_nodes - 1 by construction, so this stays in [0, 1].
+    
+    in_degree_mat[k, ]    <- igraph::degree(g, mode = "in")  / (n_nodes - 1)
+    out_degree_mat[k, ]   <- igraph::degree(g, mode = "out") / (n_nodes - 1)
+
+    g_undir <- igraph::as_undirected(g, mode = "collapse", edge.attr.comb = "sum")
+    ec <- tryCatch(
+      igraph::eigen_centrality(g_undir)$vector,
+      error = function(e) rep(NA, n_nodes)
+    )
+    eigen_mat[k, ] <- ec
+  }
+
+  list(
+    in_strength  = in_strength_mat,
+    out_strength = out_strength_mat,
+    in_degree    = in_degree_mat,
+    out_degree   = out_degree_mat,
+    eigenvector  = eigen_mat
+  )
+}
+```
+
+# extract juvenile-window grooming metrics
+
+Same body as `extract_male_grooming_metrics()`, with `group_name` /
+`start_date` / `end_date` sourced from `natal_group` /
+`juvenile_window_start` / `juvenile_window_end`.
+
+```{r extract-juvenile-grooming-function}
+extract_male_grooming_metrics_juvenile <- function(grooming_data, affiliative,
+                                                    emigrants_juv, group_presence_matrices,
+                                                    num_draws = 1000,
+                                                    prior_a = 0.1, prior_b = 0.1) {
+
+  grooming_data$date <- as.Date(grooming_data$date)
+  grooming_data$idindividual1 <- tolower(as.character(grooming_data$idindividual1))
+  grooming_data$idindividual2 <- tolower(as.character(grooming_data$idindividual2))
+
+  affiliative$date <- as.Date(affiliative$date)
+
+  results <- list()
+  posterior_draws <- list()
+
+  for (i in seq_len(nrow(emigrants_juv))) {
+
+    male_code  <- tolower(emigrants_juv$Code[i])
+    group_name <- emigrants_juv$natal_group[i]
+    start_date <- emigrants_juv$juvenile_window_start[i]
+    end_date   <- emigrants_juv$juvenile_window_end[i]
+
+    if (any(is.na(c(male_code, group_name, start_date, end_date)))) {
+      message("Skipping ", male_code, " - missing required data (juvenile)")
+      next
+    }
+
+    if (!group_name %in% names(group_presence_matrices)) {
+      message("No presence matrix for group: ", group_name, " (", male_code, ", juvenile)")
+      next
+    }
+
+    # ── 1. Observation days (from affiliative data) ─────────────────────
+    affiliative_period <- affiliative %>%
+      filter(group_Abbreviation == group_name,
+             date >= start_date,
+             date <= end_date)
+
+    days_observed <- length(unique(affiliative_period$date))
+
+    if (days_observed == 0) {
+      message("No observation days for ", male_code, " in ", group_name, " (juvenile)")
+      next
+    }
+
+    # ── 2. Grooming data in group and juvenile window ───────────────────
+    group_groom <- grooming_data %>%
+      filter(group_Abbreviation == group_name,
+             date >= start_date,
+             date <= end_date,
+             !is.na(idindividual1), idindividual1 != "",
+             !is.na(idindividual2), idindividual2 != "")
+
+    if (nrow(group_groom) == 0) {
+      message("No grooming data for ", male_code, " in ", group_name, " (juvenile)")
+      next
+    }
+
+    # ── 3. Directed dyadic counts ────────────────────────────────────────
+    dyadic_data <- group_groom %>%
+      group_by(groomer = idindividual1, groomee = idindividual2) %>%
+      summarise(event = n_distinct(date), .groups = "drop") %>%
+      filter(groomer != groomee) %>%
+      mutate(duration = days_observed)
+
+    if (nrow(dyadic_data) == 0) {
+      message("No grooming dyads for ", male_code, " (juvenile)")
+      next
+    }
+
+    all_nodes <- unique(c(dyadic_data$groomer, dyadic_data$groomee))
+
+    if (!male_code %in% all_nodes) {
+      message("Male ", male_code, " not in juvenile grooming network")
+      next
+    }
+
+    # ── 4. Median group size from presence matrix ────────────────────────
+    presence <- group_presence_matrices[[group_name]]
+    presence$Date <- as.Date(presence$Date)
+    presence_period <- presence %>%
+      filter(Date >= start_date, Date <= end_date)
+
+    median_group_size <- NA
+    if (nrow(presence_period) > 0) {
+      daily_sizes <- rowSums(presence_period[, -1, drop = FALSE], na.rm = TRUE)
+      median_group_size <- median(daily_sizes, na.rm = TRUE)
+    }
+
+    # ── 5. Compute Bayesian metrics ──────────────────────────────────────
+    tryCatch({
+
+      metrics <- compute_directed_metrics_from_posterior(
+        dyadic_data = dyadic_data,
+        all_nodes   = all_nodes,
+        num_draws   = num_draws,
+        prior_a     = prior_a,
+        prior_b     = prior_b
+      )
+
+      mi <- which(colnames(metrics$in_strength) == male_code)
+
+      if (length(mi) == 0) {
+        message("Male ", male_code, " not found in juvenile metric output")
+        next
+      }
+
+      posterior_draws[[male_code]] <- list(
+        groom_in_strength_juv  = metrics$in_strength[, mi],
+        groom_out_strength_juv = metrics$out_strength[, mi],
+        groom_in_degree_juv    = metrics$in_degree[, mi],
+        groom_out_degree_juv   = metrics$out_degree[, mi]
+      )
+
+      focal_groom <- group_groom %>%
+        filter(idindividual1 == male_code | idindividual2 == male_code)
+      grooming_rate <- length(unique(focal_groom$date)) / days_observed
+
+      results[[i]] <- tibble(
+        Code                       = male_code,
+        natal_group                = group_name,
+        window_start               = start_date,
+        window_end                 = end_date,
+        in_strength_mean           = mean(metrics$in_strength[, mi]),
+        in_strength_lower          = quantile(metrics$in_strength[, mi], 0.025),
+        in_strength_upper          = quantile(metrics$in_strength[, mi], 0.975),
+        out_strength_mean          = mean(metrics$out_strength[, mi]),
+        out_strength_lower         = quantile(metrics$out_strength[, mi], 0.025),
+        out_strength_upper         = quantile(metrics$out_strength[, mi], 0.975),
+        in_degree_mean             = mean(metrics$in_degree[, mi]),
+        in_degree_lower            = quantile(metrics$in_degree[, mi], 0.025),
+        in_degree_upper            = quantile(metrics$in_degree[, mi], 0.975),
+        out_degree_mean            = mean(metrics$out_degree[, mi]),
+        out_degree_lower           = quantile(metrics$out_degree[, mi], 0.025),
+        out_degree_upper           = quantile(metrics$out_degree[, mi], 0.975),
+        eigenvector_mean           = mean(metrics$eigenvector[, mi], na.rm = TRUE),
+        eigenvector_lower          = quantile(metrics$eigenvector[, mi], 0.025, na.rm = TRUE),
+        eigenvector_upper          = quantile(metrics$eigenvector[, mi], 0.975, na.rm = TRUE),
+        grooming_rate              = grooming_rate,
+        days_observed              = days_observed,
+        median_group_size          = median_group_size,
+        n_dyads                    = nrow(dyadic_data)
+      )
+
+      message("Done (juvenile): ", male_code, " (", group_name, ")")
+
+    }, error = function(e) {
+      message("Error for male ", male_code, " (juvenile): ", e$message)
+      NULL
+    })
+  }
+
+  summaries <- bind_rows(results)
+  list(summaries = summaries, posteriors = posterior_draws)
+}
+```
+
+# Run and save
+
+```{r run-juvenile-grooming}
+groom_results_juv <- extract_male_grooming_metrics_juvenile(
+  grooming_data, affiliative, emigrants_juv, group_presence_matrices,
+  num_draws = 1000
+)
+
+
+write.csv(groom_results_juv$summaries,
+          file.path(data_dir, "network_mets_groom_bayes_juvenile.csv"),
+          row.names = FALSE)
+
+saveRDS(groom_results_juv$posteriors,
+        file.path(data_dir, "groom_posteriors_juvenile.rds"))
+
+cat("Juvenile grooming done.", length(groom_results_juv$posteriors), "males with posteriors saved.\n")
+```
+
+# Summary
+
+```{r summary}
+cat("Males with juvenile grooming metrics:", nrow(groom_results_juv$summaries), "\n\n")
+
+summary(groom_results_juv$summaries %>%
+  select(in_strength_mean, out_strength_mean, in_degree_mean, out_degree_mean,
+         grooming_rate, days_observed))
+```
+
+```{r}
+extract_male_grooming_metrics_juvenile_no_mom <- function(grooming_data, affiliative,
+                                                            emigrants_juv, group_presence_matrices,
+                                                            num_draws = 1000,
+                                                            prior_a = 0.1, prior_b = 0.1) {
+
+  grooming_data$date <- as.Date(grooming_data$date)
+  grooming_data$idindividual1 <- tolower(as.character(grooming_data$idindividual1))
+  grooming_data$idindividual2 <- tolower(as.character(grooming_data$idindividual2))
+
+  affiliative$date <- as.Date(affiliative$date)
+
+  results <- list()
+  posterior_draws <- list()
+
+  for (i in seq_len(nrow(emigrants_juv))) {
+
+    male_code  <- tolower(emigrants_juv$Code[i])
+    mom_code   <- tolower(emigrants_juv$Momcode[i])  # NEW: needed to exclude this dyad
+    group_name <- emigrants_juv$natal_group[i]
+    start_date <- emigrants_juv$juvenile_window_start[i]
+    end_date   <- emigrants_juv$juvenile_window_end[i]
+
+    if (any(is.na(c(male_code, group_name, start_date, end_date)))) {
+      message("Skipping ", male_code, " - missing required data (juvenile)")
+      next
+    }
+
+    if (!group_name %in% names(group_presence_matrices)) {
+      message("No presence matrix for group: ", group_name, " (", male_code, ", juvenile)")
+      next
+    }
+
+    affiliative_period <- affiliative %>%
+      filter(group_Abbreviation == group_name, date >= start_date, date <= end_date)
+    days_observed <- length(unique(affiliative_period$date))
+
+    if (days_observed == 0) {
+      message("No observation days for ", male_code, " in ", group_name, " (juvenile)")
+      next
+    }
+
+    group_groom <- grooming_data %>%
+      filter(group_Abbreviation == group_name,
+             date >= start_date, date <= end_date,
+             !is.na(idindividual1), idindividual1 != "",
+             !is.na(idindividual2), idindividual2 != "")
+
+    if (nrow(group_groom) == 0) {
+      message("No grooming data for ", male_code, " in ", group_name, " (juvenile)")
+      next
+    }
+
+    # ── NEW: exclude the mother-son dyad entirely before building the
+    # network, so this male's own network metrics do not include any
+    # direct grooming with his mother during the juvenile window ──────
+    n_before <- nrow(group_groom)
+    if (!is.na(mom_code) && mom_code != "") {
+      group_groom <- group_groom %>%
+        filter(!((idindividual1 == male_code & idindividual2 == mom_code) |
+                 (idindividual1 == mom_code  & idindividual2 == male_code)))
+    }
+    n_excluded <- n_before - nrow(group_groom)
+
+    dyadic_data <- group_groom %>%
+      group_by(groomer = idindividual1, groomee = idindividual2) %>%
+      summarise(event = n_distinct(date), .groups = "drop") %>%
+      filter(groomer != groomee) %>%
+      mutate(duration = days_observed)
+
+    if (nrow(dyadic_data) == 0) {
+      message("No grooming dyads for ", male_code, " (juvenile, mom excluded)")
+      next
+    }
+
+    all_nodes <- unique(c(dyadic_data$groomer, dyadic_data$groomee))
+
+    if (!male_code %in% all_nodes) {
+      message("Male ", male_code, " not in juvenile grooming network (mom excluded)")
+      next
+    }
+
+    presence <- group_presence_matrices[[group_name]]
+    presence$Date <- as.Date(presence$Date)
+    presence_period <- presence %>% filter(Date >= start_date, Date <= end_date)
+
+    median_group_size <- NA
+    if (nrow(presence_period) > 0) {
+      daily_sizes <- rowSums(presence_period[, -1, drop = FALSE], na.rm = TRUE)
+      median_group_size <- median(daily_sizes, na.rm = TRUE)
+    }
+
+    tryCatch({
+
+      metrics <- compute_directed_metrics_from_posterior(
+        dyadic_data = dyadic_data, all_nodes = all_nodes, num_draws = num_draws,
+        prior_a = prior_a, prior_b = prior_b
+      )
+
+      mi <- which(colnames(metrics$in_strength) == male_code)
+      if (length(mi) == 0) {
+        message("Male ", male_code, " not found in juvenile metric output (mom excluded)")
+        next
+      }
+
+      posterior_draws[[male_code]] <- list(
+        groom_in_strength_juv_nomom  = metrics$in_strength[, mi],
+        groom_out_strength_juv_nomom = metrics$out_strength[, mi],
+        groom_in_degree_juv_nomom    = metrics$in_degree[, mi],
+        groom_out_degree_juv_nomom   = metrics$out_degree[, mi]
+      )
+
+      results[[i]] <- tibble(
+        Code                       = male_code,
+        natal_group                = group_name,
+        window_start               = start_date,
+        window_end                 = end_date,
+        in_strength_mean           = mean(metrics$in_strength[, mi]),
+        out_strength_mean          = mean(metrics$out_strength[, mi]),
+        in_degree_mean             = mean(metrics$in_degree[, mi]),
+        out_degree_mean            = mean(metrics$out_degree[, mi]),
+        eigenvector_mean           = mean(metrics$eigenvector[, mi], na.rm = TRUE),
+        days_observed              = days_observed,
+        median_group_size          = median_group_size,
+        n_dyads                    = nrow(dyadic_data),
+        n_mom_events_excluded      = n_excluded  # so you can see how much this removed, per male
+      )
+
+      message("Done (juvenile, mom excluded): ", male_code, " (", group_name, ") - ",
+              n_excluded, " mother-son events removed")
+
+    }, error = function(e) {
+      message("Error for male ", male_code, " (juvenile, mom excluded): ", e$message)
+      NULL
+    })
+  }
+
+  summaries <- bind_rows(results)
+  list(summaries = summaries, posteriors = posterior_draws)
+}
+```
+
+```{r}
+groom_results_juv_nomom <- extract_male_grooming_metrics_juvenile_no_mom(
+  grooming_data, affiliative, emigrants_juv, group_presence_matrices, num_draws = 1000
+)
+
+# How many mother-son grooming events were actually removed, on average?
+summary(groom_results_juv_nomom$summaries$n_mom_events_excluded)
+
+# Direct comparison: original vs mom-excluded, for the same individuals
+comparison <- groom_results_juv$summaries %>%
+  select(Code, in_strength_mean_orig = in_strength_mean, out_strength_mean_orig = out_strength_mean) %>%
+  inner_join(
+    groom_results_juv_nomom$summaries %>%
+      select(Code, in_strength_mean_nomom = in_strength_mean, out_strength_mean_nomom = out_strength_mean),
+    by = "Code"
+  )
+
+print(comparison, n = Inf)
+```
+
+```{r}
+compute_simple_strength <- function(group_groom, male_code, mom_code = NULL) {
+  
+  if (!is.null(mom_code) && !is.na(mom_code) && mom_code != "") {
+    group_groom <- group_groom %>%
+      filter(!((idindividual1 == male_code & idindividual2 == mom_code) |
+               (idindividual1 == mom_code  & idindividual2 == male_code)))
+  }
+  
+  focal <- group_groom %>% filter(idindividual1 == male_code | idindividual2 == male_code)
+  
+  in_strength  <- focal %>% filter(idindividual2 == male_code) %>% summarise(n = n_distinct(date)) %>% pull(n)
+  out_strength <- focal %>% filter(idindividual1 == male_code) %>% summarise(n = n_distinct(date)) %>% pull(n)
+  
+  tibble(in_strength = in_strength, out_strength = out_strength)
+}
+
+# Loop over your emigrants_juv sample, computing WITH and WITHOUT mom
+library(purrr)
+comparison_simple <- emigrants_juv %>%
+  filter(!is.na(natal_group), !is.na(juvenile_window_start), !is.na(juvenile_window_end)) %>%
+  rowwise() %>%
+  mutate(
+    group_groom_window = list(
+      grooming_data %>%
+        filter(group_Abbreviation == natal_group,
+               date >= juvenile_window_start, date <= juvenile_window_end)
+    ),
+    with_mom    = list(compute_simple_strength(group_groom_window, tolower(Code))),
+    without_mom = list(compute_simple_strength(group_groom_window, tolower(Code), tolower(Momcode)))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    in_with = map_dbl(with_mom, "in_strength"),
+    in_without = map_dbl(without_mom, "in_strength"),
+    out_with = map_dbl(with_mom, "out_strength"),
+    out_without = map_dbl(without_mom, "out_strength")
+  )
+
+cor.test(comparison_simple$in_with, comparison_simple$in_without)
+cor.test(comparison_simple$out_with, comparison_simple$out_without)
+```
+

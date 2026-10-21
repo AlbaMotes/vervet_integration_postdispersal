@@ -1,0 +1,379 @@
+---
+title: "9. Juvenile (pre-dispersal) proximity network metrics"
+author: "Alba Motes Rodrigo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+Computes each male's proximity network position during his OWN juvenile
+period (natal group, up to 1 year before `juvenile_period_end`), as
+opposed to script 2's post-dispersal window. Reuses
+`compute_metrics_from_posterior()` from `bison_prox_net_script.R`
+unchanged — only the window/group selection differs, via a new
+`extract_male_network_metrics_juvenile()` wrapper.
+
+```{r setup, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(igraph)
+library(tibble)
+library(purrr)
+
+data_dir <- "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data"
+
+emigrants <- read.csv(file.path(data_dir, "All_potential_immigrants_Josie_version.csv"))
+scans     <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scans_for_bison.csv")
+source(file.path(data_dir, "..", "Analyses", "scan_extraction_1mandarm.R"))
+```
+
+# Build the juvenile window
+
+```{r build-juvenile-window}
+# natal_group     = BirthGp (as opposed to ImmigrationGp1 post-dispersal)
+# window          = DOB + 365 days (excludes the infant year) through
+#                   dispersal (DateImmigration1, falling back to
+#                   DepartureNatalGp when DateImmigration1 is missing,
+#                   consistent with the dispersal-date convention used
+#                   elsewhere in the pipeline, e.g. elo_rating_male_calculator.R)
+# This is the FULL span, not clipped to a fixed length — unlike the
+# post-dispersal window (fixed at 1 year post-immigration), the
+# juvenile period is naturally variable in length across males.
+build_juvenile_window <- function(emigrants) {
+  emigrants %>%
+    mutate(
+      DOB              = as.Date(DOB),
+      DateImmigration1 = as.Date(DateImmigration1),
+      DepartureNatalGp = as.Date(DepartureNatalGp),
+      natal_group      = BirthGp,
+      dispersal_date   = if_else(!is.na(DateImmigration1), DateImmigration1, DepartureNatalGp),
+      juvenile_window_start = DOB + 365,
+      juvenile_window_end   = dispersal_date
+    )
+}
+
+emigrants_juv <- build_juvenile_window(emigrants)
+
+cat("Males who dispersed before turning 1 year old (window invalid - start > end):\n")
+emigrants_juv %>%
+  filter(!is.na(juvenile_window_start), !is.na(juvenile_window_end),
+         juvenile_window_start >= juvenile_window_end) %>%
+  select(Code, DOB, dispersal_date, juvenile_window_start, juvenile_window_end) %>%
+  print()
+
+# Guard against the invalid case above producing a negative-length window
+emigrants_juv <- emigrants_juv %>%
+  mutate(
+    juvenile_window_start = if_else(juvenile_window_start < juvenile_window_end,
+                                     juvenile_window_start, as.Date(NA)),
+    juvenile_window_end   = if_else(!is.na(juvenile_window_start), juvenile_window_end, as.Date(NA))
+  )
+
+cat("\nDistribution of juvenile window length (days), among valid windows:\n")
+print(summary(as.numeric(emigrants_juv$juvenile_window_end - emigrants_juv$juvenile_window_start)))
+
+cat("\nMales missing natal_group / window entirely:\n")
+emigrants_juv %>%
+  summarise(
+    n_total              = n(),
+    n_has_natal_group    = sum(!is.na(natal_group)),
+    n_has_window_start   = sum(!is.na(juvenile_window_start)),
+    n_has_window_end     = sum(!is.na(juvenile_window_end))
+  ) %>% print()
+```
+
+# Helper: compute network metrics from Beta posterior samples
+
+Identical to `bison_prox_net_script.R` — reused unchanged, since this
+function doesn't know or care whether the network being summarised is
+the natal or the destination network.
+
+```{r compute-metrics-function}
+compute_metrics_from_posterior <- function(dyadic_data, all_nodes, focal_node,
+                                           num_draws = 1000,
+                                           prior_a = 0.1, prior_b = 0.1,
+                                           edge_thresh = 0.0001) {
+
+  n_dyads <- nrow(dyadic_data)
+  n_nodes <- length(all_nodes)
+
+  draw_mat <- matrix(NA, nrow = n_dyads, ncol = num_draws)
+  for (d in 1:n_dyads) {
+    draw_mat[d, ] <- rbeta(num_draws,
+                           prior_a + dyadic_data$event[d],
+                           prior_b + dyadic_data$duration[d] - dyadic_data$event[d])
+  }
+
+  node1 <- as.character(dyadic_data$node_1)
+  node2 <- as.character(dyadic_data$node_2)
+
+  strength_draws <- numeric(num_draws)
+  degree_draws   <- numeric(num_draws)
+
+  for (k in 1:num_draws) {
+
+    adj <- matrix(0, n_nodes, n_nodes, dimnames = list(all_nodes, all_nodes))
+    for (r in 1:n_dyads) {
+      w <- draw_mat[r, k]
+      if (w < edge_thresh) w <- 0
+      adj[node1[r], node2[r]] <- w
+      adj[node2[r], node1[r]] <- w
+    }
+
+    g <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE)
+
+    strength_draws[k] <- igraph::strength(g)[focal_node]
+    # Juvenile windows can span multiple years, so group membership turns
+    # over - median daily group size can be smaller than the cumulative
+    # network. Normalizing by n_nodes - 1 (the network's own observed
+    # size) avoids that mismatch entirely; degree can never exceed
+    # n_nodes - 1 by construction, so this is always in [0, 1].
+    degree_draws[k]   <- igraph::degree(g)[focal_node] / (n_nodes - 1)
+  }
+
+  list(strength_draws = strength_draws, degree_draws = degree_draws)
+}
+```
+
+# New wrapper: extract juvenile-window network metrics
+
+Same body as `extract_male_network_metrics()` in `bison_prox_net_script.R`,
+with `group_name`/`start_date`/`end_date` sourced from `natal_group` /
+`juvenile_window_start` / `juvenile_window_end` instead of
+`ImmigrationGp1` / `DateImmigration1` / `+365`.
+
+```{r extract-juvenile-metrics-function}
+extract_male_network_metrics_juvenile <- function(scans, emigrants_juv, num_draws = 1000) {
+
+  contact_behaviours <- c(
+    "allogrooming: groom", "allogrooming: being groomed",
+    "affiliative: sit in contact", "affiliative: mouth to mouth",
+    "affiliative: nurse", "affiliative: infant handling",
+    "groom", "being groomed", "mouth to mouth", "mouth fed from",
+    "feed from mouth", "nurse", "infant handle", "play-mount",
+    "gr", "bgr", "mc", "bmc", "pm", "bpm", "sm", "bsm",
+    "to", "bto", "ca", "em", "nu", "ih", "ii", "sg",
+    "bite", "being bitten", "hit", "being hit", "grab",
+    "hand on head", "hand on top of head (hh)", "attack", "chase",
+    "fm", "bfm", "gb", "bgb", "bi", "bbi", "hi", "bhi",
+    "fi", "hh", "bhh", "so", "bso",
+    "sexual: mount", "sexual: be-mounted", "sexual: being mounted",
+    "sexual: inspect", "sexual: solicit", "sexual: be solicited",
+    "play: sexual", "mu", "bmu", "hg", "bhg", "bs", "bbs"
+  )
+
+  results <- list()
+  posterior_draws <- list()
+
+  for (i in seq_len(nrow(emigrants_juv))) {
+
+    male_code  <- emigrants_juv$Code[i]
+    group_name <- emigrants_juv$natal_group[i]
+    start_date <- emigrants_juv$juvenile_window_start[i]
+    end_date   <- emigrants_juv$juvenile_window_end[i]
+
+    if (any(is.na(c(male_code, group_name, start_date, end_date)))) {
+      message("Skipping ", male_code, " - missing required data")
+      next
+    }
+
+    scans_filtered <- scans %>%
+      mutate(date = as.Date(date)) %>%
+      filter(group_Abbreviation == group_name,
+             !is.na(date),
+             date >= start_date,
+             date <= end_date)
+
+    if (nrow(scans_filtered) == 0) {
+      message("No scan data for male ", male_code, " (juvenile window)")
+      next
+    }
+
+    scans_filtered$year <- as.numeric(format(scans_filtered$date, "%Y"))
+    proximity_data <- extract_proximity_pairs(scans_filtered)
+
+    if (is.null(proximity_data) || nrow(proximity_data) == 0) {
+      message("No proximity data for male ", male_code, " (juvenile window)")
+      next
+    }
+
+    from_focal <- scans_filtered %>%
+      filter(!is.na(idindividual1) & idindividual1 != "") %>%
+      mutate(
+        is_contact    = trimws(tolower(behaviour))     %in% contact_behaviours |
+          trimws(tolower(behaviourtype)) %in% contact_behaviours,
+        has_proximity = (!is.na(ind1m)        & ind1m        != "") |
+          (!is.na(indarmlength) & indarmlength != "") |
+          (!is.na(nnadult)      & nnadult      != "") |
+          (!is.na(nnjuvenile)   & nnjuvenile   != ""),
+        exclude       = is_contact & !has_proximity
+      ) %>%
+      filter(!exclude) %>%
+      distinct(idindividual1, scan_id) %>%
+      rename(individual = idindividual1)
+
+    from_proximity <- proximity_data %>%
+      filter(!is.na(interaction_partner) & interaction_partner != "") %>%
+      distinct(interaction_partner, scan_id) %>%
+      rename(individual = interaction_partner)
+
+    individual_scan_counts <- bind_rows(from_focal, from_proximity) %>%
+      distinct() %>%
+      group_by(individual) %>%
+      summarise(scans_sampled = n_distinct(scan_id), .groups = "drop")
+
+    dyadic_data <- proximity_data %>%
+      filter(!is.na(idindividual1) & idindividual1 != "",
+             !is.na(interaction_partner) & interaction_partner != "") %>%
+      mutate(
+        node_1 = pmin(idindividual1, interaction_partner),
+        node_2 = pmax(idindividual1, interaction_partner)
+      ) %>%
+      filter(node_1 != node_2) %>%
+      group_by(node_1, node_2) %>%
+      summarise(event = n_distinct(scan_id), .groups = "drop") %>%
+      left_join(individual_scan_counts, by = c("node_1" = "individual")) %>%
+      rename(scans_node_1 = scans_sampled) %>%
+      left_join(individual_scan_counts, by = c("node_2" = "individual")) %>%
+      rename(scans_node_2 = scans_sampled) %>%
+      mutate(
+        duration = scans_node_1 + scans_node_2 - event,
+        sri      = event / duration
+      )
+
+    if (nrow(dyadic_data) == 0 ||
+        !male_code %in% c(dyadic_data$node_1, dyadic_data$node_2)) {
+      message("Male ", male_code, " has no dyads in juvenile network")
+      next
+    }
+
+    all_nodes <- unique(c(dyadic_data$node_1, dyadic_data$node_2))
+
+    tryCatch({
+
+      metrics <- compute_metrics_from_posterior(
+        dyadic_data = dyadic_data,
+        all_nodes   = all_nodes,
+        focal_node  = male_code,
+        num_draws   = num_draws,
+        prior_a     = 0.1,
+        prior_b     = 0.1
+      )
+
+      posterior_draws[[male_code]] <- list(
+        prox_strength_juv = metrics$strength_draws,
+        prox_degree_juv   = metrics$degree_draws
+      )
+
+      male_dyads     <- dyadic_data %>%
+        filter(node_1 == male_code | node_2 == male_code)
+      strength_assoc <- sum(male_dyads$sri)
+
+      results[[i]] <- tibble(
+        Code             = male_code,
+        natal_group      = group_name,
+        window_start     = start_date,
+        window_end       = end_date,
+        strength_mean    = mean(metrics$strength_draws),
+        strength_lower   = quantile(metrics$strength_draws, 0.025),
+        strength_upper   = quantile(metrics$strength_draws, 0.975),
+        degree_mean      = mean(metrics$degree_draws),
+        degree_lower     = quantile(metrics$degree_draws, 0.025),
+        degree_upper     = quantile(metrics$degree_draws, 0.975),
+        strength_assoc   = strength_assoc,
+        n_dyads          = nrow(dyadic_data),
+        n_scans          = individual_scan_counts$scans_sampled[
+          individual_scan_counts$individual == male_code]
+      )
+
+      message("Done (juvenile): ", male_code, " (", group_name, ")")
+
+    }, error = function(e) {
+      message("Metric extraction error for male ", male_code, " (juvenile): ", e$message)
+      NULL
+    })
+  }
+
+  summaries <- bind_rows(results)
+  list(summaries = summaries, posteriors = posterior_draws)
+}
+```
+
+# Run and save
+
+```{r run-juvenile-proximity}
+prox_results_juv <- extract_male_network_metrics_juvenile(scans, emigrants_juv, num_draws = 1000)
+
+write.csv(prox_results_juv$summaries,
+          file.path(data_dir, "network_mets_prox_bayes_juvenile.csv"),
+          row.names = FALSE)
+
+saveRDS(prox_results_juv$posteriors,
+        file.path(data_dir, "prox_posteriors_juvenile.rds"))
+
+cat("Juvenile proximity done.", length(prox_results_juv$posteriors), "males with posteriors saved.\n")
+```
+
+```{r}
+emigrants_juv %>%
+  filter(!is.na(BirthGp)) %>%   # restrict to natal males, where this should matter
+  mutate(
+    missing_natal_group = is.na(natal_group),
+    missing_start        = is.na(juvenile_window_start),
+    missing_end          = is.na(juvenile_window_end)
+  ) %>%
+  summarise(
+    n_total               = n(),
+    n_missing_natal_group = sum(missing_natal_group),
+    n_missing_start       = sum(missing_start),
+    n_missing_end         = sum(missing_end),
+    n_any_missing         = sum(missing_natal_group | missing_start | missing_end)
+  ) %>% print()
+
+# If n_missing_start is high, this tells you why:
+emigrants_juv %>%
+  filter(!is.na(BirthGp), is.na(juvenile_window_start)) %>%
+  select(Code, DOB, DateImmigration1, DepartureNatalGp, dispersal_date) %>%
+  print()
+```
+
+```{r}
+emigrants_juv %>%
+  filter(!is.na(BirthGp), !is.na(natal_group),
+         !is.na(juvenile_window_start), !is.na(juvenile_window_end)) %>%
+  rowwise() %>%
+  mutate(
+    n_scans_in_window = sum(
+      as.Date(scans$date) >= juvenile_window_start &
+      as.Date(scans$date) <= juvenile_window_end &
+      scans$group_Abbreviation == natal_group,
+      na.rm = TRUE
+    )
+  ) %>%
+  ungroup() %>%
+  summarise(
+    n_valid_window   = n(),
+    n_zero_scans     = sum(n_scans_in_window == 0),
+    n_some_scans     = sum(n_scans_in_window > 0)
+  ) %>% print()
+```
+
+  n_valid_window n_zero_scans n_some_scans
+           <int>        <int>        <int>
+1             87            0           87
+# Summary
+
+```{r summary}
+cat("Males with juvenile proximity metrics:", nrow(prox_results_juv$summaries), "\n\n")
+
+summary(prox_results_juv$summaries %>%
+  select(degree_mean, strength_mean, strength_assoc, n_scans))
+```
+ degree_mean      strength_mean    strength_assoc       n_scans     
+ Min.   :0.02216   Min.   :0.0119   Min.   :0.01076   Min.   :  3.0  
+ 1st Qu.:0.30551   1st Qu.:0.2017   1st Qu.:0.19410   1st Qu.:184.0  
+ Median :0.46152   Median :0.2557   Median :0.24694   Median :424.0  
+ Mean   :0.42502   Mean   :0.2546   Mean   :0.24762   Mean   :398.1  
+ 3rd Qu.:0.54717   3rd Qu.:0.3093   3rd Qu.:0.30379   3rd Qu.:597.0  
+ Max.   :0.71457   Max.   :0.5622   Max.   :0.53241   Max.   :912.0  

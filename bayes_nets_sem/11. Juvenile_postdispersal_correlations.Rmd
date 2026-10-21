@@ -1,0 +1,363 @@
+---
+title: "11.Juvenile_vs_PostDispersal_Network_Correlations"
+author: "Alba Motes Rodrigo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Setup
+
+```{r libraries}
+library(dplyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(ggcorrplot)
+```
+
+```{r paths}
+data_dir <- "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data"
+```
+
+# Load all data
+
+```{r load-data}
+# Merged demographic / predictor data (built in script 4)
+emigrants_full <- read.csv(file.path(data_dir, "emigrants_full_merged.csv"))
+
+# Post-dispersal (adult) network posteriors
+prox_posteriors  <- readRDS(file.path(data_dir, "prox_posteriors.rds"))
+groom_posteriors <- readRDS(file.path(data_dir, "groom_posteriors.rds"))
+
+# Juvenile network posteriors
+prox_posteriors_juv  <- readRDS(file.path(data_dir, "prox_posteriors_juvenile.rds"))
+groom_posteriors_juv <- readRDS(file.path(data_dir, "groom_posteriors_juvenile.rds"))
+
+cat("emigrants_full:", nrow(emigrants_full), "rows,", ncol(emigrants_full), "columns\n")
+cat("prox_posteriors:", length(prox_posteriors), "males\n")
+cat("groom_posteriors:", length(groom_posteriors), "males\n")
+cat("prox_posteriors_juv:", length(prox_posteriors_juv), "males\n")
+cat("groom_posteriors_juv:", length(groom_posteriors_juv), "males\n")
+```
+
+> cat("emigrants_full:", nrow(emigrants_full), "rows,", ncol(emigrants_full), "columns\n")
+emigrants_full: 212 rows, 77 columns
+> cat("prox_posteriors:", length(prox_posteriors), "males\n")
+prox_posteriors: 125 males
+> cat("groom_posteriors:", length(groom_posteriors), "males\n")
+groom_posteriors: 132 males
+> cat("prox_posteriors_juv:", length(prox_posteriors_juv), "males\n")
+prox_posteriors_juv: 81 males
+> cat("groom_posteriors_juv:", length(groom_posteriors_juv), "males\n")
+groom_posteriors_juv: 77 males
+
+# Metric specs
+
+```{r specs}
+mediator_specs_adult <- list(
+  list(name = "prox_strength",      posteriors = prox_posteriors,  field = "prox_strength"),
+  list(name = "prox_degree",        posteriors = prox_posteriors,  field = "prox_degree"),
+  list(name = "groom_out_strength", posteriors = groom_posteriors, field = "groom_out_strength"),
+  list(name = "groom_in_strength",  posteriors = groom_posteriors, field = "groom_in_strength"),
+  list(name = "groom_out_degree",   posteriors = groom_posteriors, field = "groom_out_degree"),
+  list(name = "groom_in_degree",    posteriors = groom_posteriors, field = "groom_in_degree")
+)
+
+mediator_specs_juv <- list(
+  list(name = "prox_strength_juv",      posteriors = prox_posteriors_juv,  field = "prox_strength_juv"),
+  list(name = "prox_degree_juv",        posteriors = prox_posteriors_juv,  field = "prox_degree_juv"),
+  list(name = "groom_out_strength_juv", posteriors = groom_posteriors_juv, field = "groom_out_strength_juv"),
+  list(name = "groom_in_strength_juv",  posteriors = groom_posteriors_juv, field = "groom_in_strength_juv"),
+  list(name = "groom_out_degree_juv",   posteriors = groom_posteriors_juv, field = "groom_out_degree_juv"),
+  list(name = "groom_in_degree_juv",    posteriors = groom_posteriors_juv, field = "groom_in_degree_juv")
+)
+```
+
+```{r summarize-fn}
+# If you already have summarize_network_draws() defined/sourced elsewhere in
+# your project (e.g. script 5), delete this chunk and source that file instead
+# so both scripts use the identical implementation.
+summarize_network_draws <- function(draws) {
+  tibble(
+    estimate_mean   = mean(draws),
+    estimate_median = median(draws),
+    network_q025    = quantile(draws, 0.025, names = FALSE),
+    network_q975    = quantile(draws, 0.975, names = FALSE),
+    prop_positive   = mean(draws > 0),
+    prop_negative   = mean(draws < 0)
+  )
+}
+```
+
+# Correlation function
+
+Draw-matched correlation: for each posterior draw *k*, take every male's
+juvenile-metric value and his post-dispersal-metric value, correlate across
+males, and repeat over draws to build a posterior distribution of *r*.
+Only males present in **both** posterior objects (tracked as juveniles,
+dispersed, and re-tracked as adults) are included.
+
+```{r correlation-function}
+correlate_juvenile_post_dispersal <- function(adult_specs, juv_specs,
+                                               num_draws = 1000,
+                                               method = "pearson") {
+
+  adult_names <- sapply(adult_specs, function(s) s$name)
+  juv_names   <- sapply(juv_specs,   function(s) s$name)
+
+  # match juvenile "X_juv" to adult "X"
+  pairs <- list()
+  for (jn in juv_names) {
+    base_name <- sub("_juv$", "", jn)
+    if (base_name %in% adult_names) {
+      pairs[[base_name]] <- list(juv = jn, adult = base_name)
+    } else {
+      cat("No adult match found for '", jn, "' - skipping\n", sep = "")
+    }
+  }
+
+  all_results <- list()
+  all_pooled  <- list()
+
+  for (pn in names(pairs)) {
+
+    juv_spec   <- juv_specs[[which(juv_names == pairs[[pn]]$juv)]]
+    adult_spec <- adult_specs[[which(adult_names == pairs[[pn]]$adult)]]
+
+    cat("\n>>> Correlating", pairs[[pn]]$juv, "<->", pairs[[pn]]$adult, "\n")
+
+    common_codes <- intersect(names(juv_spec$posteriors), names(adult_spec$posteriors))
+
+    if (length(common_codes) < 10) {
+      cat("  Too few males with both posteriors:", length(common_codes), "- skipping\n")
+      next
+    }
+    cat("  n males =", length(common_codes), "\n")
+
+    juv_draws_avail   <- length(juv_spec$posteriors[[common_codes[1]]][[juv_spec$field]])
+    adult_draws_avail <- length(adult_spec$posteriors[[common_codes[1]]][[adult_spec$field]])
+    draws_use <- min(num_draws, juv_draws_avail, adult_draws_avail)
+
+    if (draws_use < num_draws) {
+      cat("  Requested", num_draws, "draws but only", draws_use, "available - using", draws_use, "\n")
+    }
+
+    r_all <- numeric(draws_use)
+
+    for (k in 1:draws_use) {
+      juv_vals   <- sapply(common_codes, function(id) juv_spec$posteriors[[id]][[juv_spec$field]][k])
+      adult_vals <- sapply(common_codes, function(id) adult_spec$posteriors[[id]][[adult_spec$field]][k])
+      r_all[k] <- cor(juv_vals, adult_vals, method = method, use = "complete.obs")
+    }
+
+    res <- summarize_network_draws(r_all) %>%
+      mutate(juvenile_metric       = pairs[[pn]]$juv,
+             post_dispersal_metric = pairs[[pn]]$adult,
+             n_males               = length(common_codes),
+             num_draws             = draws_use,
+             method                = method,
+             .before = 1)
+
+    cat(sprintf("  r mean = %6.3f  95%% CI [%6.3f, %6.3f]  pd = %4.1f%%\n",
+                res$estimate_mean, res$network_q025, res$network_q975,
+                max(res$prop_positive, res$prop_negative) * 100))
+
+    all_results[[pn]] <- res
+    all_pooled[[pn]]  <- r_all
+  }
+
+  list(summary = bind_rows(all_results), pooled = all_pooled)
+}
+```
+
+# Run
+
+```{r run-correlations}
+corr_out <- correlate_juvenile_post_dispersal(
+  mediator_specs_adult, mediator_specs_juv,
+  num_draws = 1000,
+  method = "pearson"   # switch to "spearman" if strength/degree are skewed
+)
+
+print(as.data.frame(corr_out$summary), row.names = FALSE)
+```
+
+# Plot: posterior distribution of each correlation
+
+```{r plot-correlations, fig.width=9, fig.height=6}
+plot_data <- imap_dfr(corr_out$pooled, ~ tibble(pair = .y, r = .x))
+
+# Map raw metric names to clean display labels
+label_map <- c(
+  "prox_strength"      = "Proximity strength",
+  "prox_degree"        = "Proximity degree",
+  "groom_out_strength" = "Groom out-strength",
+  "groom_in_strength"  = "Groom in-strength",
+  "groom_out_degree"   = "Groom out-degree",
+  "groom_in_degree"    = "Groom in-degree"
+)
+
+plot_data$pair_label <- label_map[plot_data$pair]
+
+# order facets by posterior mean r, most positive first
+pair_order <- corr_out$summary %>%
+  arrange(desc(estimate_mean)) %>%
+  mutate(pair_label = label_map[post_dispersal_metric]) %>%
+  pull(pair_label)
+
+plot_data$pair_label <- factor(plot_data$pair_label, levels = pair_order)
+
+ggplot(plot_data, aes(x = r, fill = pair_label)) +
+  geom_density(alpha = 0.6, color = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ pair_label, scales = "free_y") +
+  scale_fill_viridis_d(guide = "none") +
+  labs(
+    x = "Correlation (r) between juvenile and post-dispersal metrics",
+    y = "Density",
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face = "plain"))
+```
+
+grooming metrics show consistent, non-trivial positive continuity from juvenile to adult; proximity strength is null; proximity degree is negative.
+grooming relationships seem to carry forward across the dispersal transition in a way proximity doesn't, and proximity degree even seems to invert.
+# Save results
+
+```{r save}
+write.csv(corr_out$summary,
+          file.path(data_dir, "juvenile_vs_postdispersal_correlations.csv"),
+          row.names = FALSE)
+saveRDS(corr_out$pooled,
+        file.path(data_dir, "juvenile_vs_postdispersal_correlation_draws.rds"))
+
+ggsave(file.path(data_dir, "juvenile_vs_postdispersal_correlation_densities.png"),
+       width = 9, height = 6, dpi = 300)
+
+cat("\nDone. Saved:\n -",
+    file.path(data_dir, "juvenile_vs_postdispersal_correlations.csv"), "\n -",
+    file.path(data_dir, "juvenile_vs_postdispersal_correlation_draws.rds"), "\n -",
+    file.path(data_dir, "juvenile_vs_postdispersal_correlation_densities.png"), "\n")
+```
+
+```{r}
+check_codes <- intersect(names(prox_posteriors_juv), names(prox_posteriors)) 
+set.seed(1)
+sample_codes <- sample(check_codes, 6)
+
+par(mfrow = c(2, 3))
+for (id in sample_codes) {
+  hist(prox_posteriors[[id]]$prox_degree,
+       main = paste(id, "- adult prox_degree"),
+       xlab = "value", breaks = 30, col = "steelblue")
+}
+```
+
+# Correlation among maternal characteristics
+
+```{r}
+
+library(dplyr)
+
+maternal_label_map <- c(
+  "mother_avg_elo"              = "Maternal rank",
+  "mom_groom_proportion"        = "Maternal grooming\ninvestment",
+  "mom_prox_proportion"         = "Maternal proximity\ninvestment",
+  "mom_groom_eigen_mean"        = "Mother grooming\neigen-centrality",
+  "mom_prox_eigen_mean"         = "Mother proximity\neigen-centrality"
+)
+
+maternal_vars <- emigrants_full %>%
+  select(all_of(names(maternal_label_map)))
+
+# Rename columns to the clean labels BEFORE computing correlations, so
+# the labels appear directly in the matrix/plot
+names(maternal_vars) <- maternal_label_map[names(maternal_vars)]
+
+cor_matrix <- cor(maternal_vars, use = "pairwise.complete.obs", method = "pearson")
+
+ggcorrplot::ggcorrplot(cor_matrix, type = "upper", lab = TRUE, lab_size = 3.5,
+           colors = c("#C62828", "white", "#1565C0"),
+           tl.cex = 11, tl.srt = 45) +
+  theme(plot.margin = margin(5, 5, 5, 5))
+
+# Pairwise correlation matrix, handling missing data per pair (not
+# requiring complete cases across all 7 variables at once, since sample
+# sizes vary a lot by variable in this project)
+cor_matrix <- cor(maternal_vars, use = "pairwise.complete.obs", method = "pearson")
+
+print(round(cor_matrix, 2))
+
+library(Hmisc)
+
+cor_results <- rcorr(as.matrix(maternal_vars), type = "pearson")
+cor_results$r  # correlation coefficients
+cor_results$P  # p-values
+cor_results$n  # sample size per pair (important given how much n varies here)
+
+```
+
+#Plot maternalmale ranks
+```{r}
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+
+# ── Data ──────────────────────────────────────────────────────────────
+# x = maternal rank, y = male rank one year post-dispersal
+# color = natal group (BirthGp), shape = immigration group (ImmigrationGp1)
+plot_data <- emigrants_full %>%
+  filter(!is.na(mother_avg_elo), !is.na(elo_one_year_male_male))
+
+# ggplot's default shape scale only has 6 distinct values before it
+# recycles/errors — expand it in case there are more than 6 immigration
+# groups (BD, NH, AK, KB, LT, CR, IF = up to 7 in your data)
+n_immig_groups <- n_distinct(plot_data$ImmigrationGp1)
+shape_values   <- c(16, 17, 15, 18, 8, 3, 4, 7, 9, 10, 11, 12)[seq_len(n_immig_groups)]
+
+# Muted/pastel palette for natal group — Set2 is muted and colorblind-safe,
+# with 8 distinct colors (RColorBrewer caps at 8 for qualitative palettes)
+n_natal_groups <- n_distinct(plot_data$BirthGp)
+natal_colors   <- brewer.pal(max(n_natal_groups, 3), "Set2")[seq_len(n_natal_groups)]
+
+p <- ggplot(plot_data, aes(x = mother_avg_elo, y = elo_one_year_male_male)) +
+  geom_point(aes(color = BirthGp, shape = ImmigrationGp1), size = 3, alpha = 0.85) +
+  geom_smooth(method = "lm", color = "black", se = TRUE, linewidth = 0.8) +
+  scale_shape_manual(values = shape_values) +
+  scale_color_manual(values = natal_colors) +
+  labs(
+    x     = "Maternal rank during the juvenile period",
+    y     = "Male rank one year post-dispersal",
+    color = "Natal group",
+    shape = "Immigration group"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position  = "right"
+  )
+
+print(p)
+
+ggsave(
+  filename = file.path(data_dir, "maternal_vs_male_rank.png"),
+  plot = p, width = 8, height = 6, dpi = 300
+)
+
+# ── Variant: separate regression line per natal group instead of one
+#    overall line — uncomment if that's what you actually want ─────────
+# p_bygroup <- ggplot(plot_data, aes(x = mother_avg_elo, y = elo_one_year_male_male, color = BirthGp)) +
+#   geom_point(aes(shape = ImmigrationGp1), size = 3, alpha = 0.85) +
+#   geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+#   scale_shape_manual(values = shape_values) +
+#   labs(x = "Maternal rank (Elo)", y = "Male rank, one year post-dispersal (Elo)",
+#        color = "Natal group", shape = "Immigration group") +
+#   theme_minimal(base_size = 13)
+# print(p_bygroup)
+```
+
+

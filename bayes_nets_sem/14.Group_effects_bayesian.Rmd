@@ -1,0 +1,467 @@
+---
+title: "Group effects: natal group ICC and dispersal-context regression"
+output: html_document
+---
+
+# Load data
+
+```{r load-data}
+library(dplyr)
+library(tibble)
+library(brms)
+
+data_dir <- "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data"
+
+emigrants_full <- read.csv(file.path(data_dir, "emigrants_full_merged.csv"))
+```
+
+# Step 0: confirm group-size / sex-ratio columns
+
+Run this before trusting anything below the outputs of Test 2 - adjust the
+column names used later in the script to match whatever's actually here.
+
+```{r step0-columns}
+cat("Columns matching size/ratio/sex:\n")
+print(grep("size|ratio|sex", names(emigrants_full), ignore.case = TRUE, value = TRUE))
+```
+
+# Generic engine: posterior-propagated outcome model
+
+Fits a model once, then refits on a fresh posterior draw of the OUTCOME on
+every iteration `k` (same pattern as `run_mother_eigen_mediation_bayesian_joint`
+/ `run_juvenile_mediation_bayesian_joint_eigen` elsewhere in this pipeline).
+Returns every MCMC sample from every draw `k` pooled together, so downstream
+summaries reflect both (a) uncertainty in each male's own network-position
+estimate and (b) ordinary model/parameter uncertainty - not just the
+posterior mean plugged in as if it were observed without error.
+
+```{r engine}
+run_posterior_outcome_model <- function(data, id_col, posteriors, field, formula_rhs,
+                                         num_draws = 1000, chains = 2, iter = 2000,
+                                         warmup = 1000, adapt_delta = 0.95) {
+
+  ids_with_post <- data[[id_col]][data[[id_col]] %in% names(posteriors)]
+  dat <- data %>% filter(.data[[id_col]] %in% ids_with_post)
+
+  if (nrow(dat) < 10) stop("Too few individuals with posteriors (n = ", nrow(dat), ")")
+
+  actual_draws <- length(posteriors[[dat[[id_col]][1]]][[field]])
+  num_draws <- min(num_draws, actual_draws)
+
+  build_draw_data <- function(k) {
+    dat_k <- dat
+    dat_k$outcome <- sapply(dat_k[[id_col]], function(id) posteriors[[id]][[field]][k])
+    dat_k
+  }
+
+  dat_1 <- build_draw_data(1)
+  f <- bf(as.formula(paste0("outcome ~ ", formula_rhs)))
+
+  cat("  Compiling model (draw 1) for outcome field:", field, "...\n")
+  fit_base <- brm(f, data = dat_1, family = gaussian(),
+                   chains = chains, iter = iter, warmup = warmup, seed = 1,
+                   refresh = 0, silent = 2, control = list(adapt_delta = adapt_delta))
+
+  all_draws <- list(as_draws_df(fit_base))
+
+  for (k in 2:num_draws) {
+    dat_k <- build_draw_data(k)
+    fit_k <- update(fit_base, newdata = dat_k, recompile = FALSE, refresh = 0, silent = 2)
+    all_draws[[k]] <- as_draws_df(fit_k)
+  }
+
+  list(n = nrow(dat), num_draws = num_draws, pooled = bind_rows(all_draws))
+}
+```
+
+# Test 1: Natal group identity -> maternal rank & sons' pre-dispersal behaviour
+
+Variance-partitioning (ICC) via a random intercept on `BirthGp`: what
+fraction of variance in each outcome is attributable to which natal group
+a male was born into.
+
+Restricted to the same N=33 males used in the actual mediation analyses
+(non-missing `mother_avg_elo` AND `elo_one_year_male_male`, matching Table
+S3's sample) rather than the broader population - the point here is to
+check whether the mediation *results* are confounded by natal group, not
+to characterize natal-group effects across all males more generally.
+This same N=33 core sample is also used for Test 2 below.
+
+```{r icc-sample}
+# Core mediation sample - just the rank-mediation criterion, no BirthGp
+# constraint, so it can be reused for Test 2 (which doesn't use BirthGp)
+# without natal-group-specific filtering leaking in.
+mediation_sample_codes <- emigrants_full %>%
+  filter(!is.na(mother_avg_elo), !is.na(elo_one_year_male_male)) %>%
+  pull(Code)
+
+cat("Core mediation sample size:", length(mediation_sample_codes), "\n")
+
+# Test 1's version adds the natal-group-specific filters on top
+emigrants_full_icc <- emigrants_full %>%
+  filter(Code %in% mediation_sample_codes, !is.na(BirthGp), BirthGp != "CR")
+
+cat("Test 1 (natal group) sample size:", nrow(emigrants_full_icc), "\n")
+cat("Natal groups represented:", paste(sort(unique(emigrants_full_icc$BirthGp)), collapse = ", "), "\n")
+```
+
+## 1a. Fixed-value outcomes (maternal rank)
+
+Maternal rank is a genuinely observed value, not a posterior distribution,
+so a single ordinary fit is correct here - no draw-loop needed.
+
+```{r test1a-fixed}
+fit_natal_group_icc_fixed <- function(outcome, data) {
+  f <- bf(as.formula(paste0(outcome, " ~ 1 + (1 | BirthGp)")))
+  fit <- brm(f, data = data, family = gaussian(),
+             chains = 2, iter = 2000, warmup = 1000, seed = 1,
+             refresh = 0, silent = 2, control = list(adapt_delta = 0.99))
+  draws <- as_draws_df(fit)
+  icc <- draws$sd_BirthGp__Intercept^2 / (draws$sd_BirthGp__Intercept^2 + draws$sigma^2)
+  tibble(outcome = outcome, n = nrow(data), icc_mean = mean(icc), icc_median = median(icc),
+         icc_q025 = quantile(icc, 0.025), icc_q975 = quantile(icc, 0.975))
+}
+
+natal_group_results_fixed <- fit_natal_group_icc_fixed("mother_avg_elo", emigrants_full_icc)
+print(natal_group_results_fixed)
+```
+
+print(natal_group_results_fixed)
+# A tibble: 1 × 6
+  outcome            n icc_mean icc_median icc_q025 icc_q975
+  <chr>          <int>    <dbl>      <dbl>    <dbl>    <dbl>
+1 mother_avg_elo    33    0.126     0.0598 0.000115    0.560
+
+## 1a-extended. Other maternal characteristics (point-estimate ICC)
+
+Same fixed-value approach as above, extended to the other four maternal
+variables (investment and eigen-centrality). Uses point-estimate posterior
+means (`mom_groom_eigen_mean`/`mom_prox_eigen_mean`) rather than full
+posterior propagation - a tractability tradeoff, consistent with how
+`mother_avg_elo` above is already treated as a fixed value.
+
+```{r test1a-maternal-extended}
+maternal_icc_fields <- c(
+  "mom_groom_proportion",
+  "mom_prox_proportion",
+  "mom_groom_eigen_mean",
+  "mom_prox_eigen_mean"
+)
+
+natal_group_results_maternal <- bind_rows(lapply(maternal_icc_fields, function(outcome) {
+  if (!outcome %in% names(emigrants_full_icc)) {
+    message("Column '", outcome, "' not found - skipping")
+    return(NULL)
+  }
+  cat("Fitting natal-group ICC for:", outcome, "\n")
+  fit_natal_group_icc_fixed(
+    outcome,
+    emigrants_full_icc %>% filter(!is.na(.data[[outcome]]))
+  )
+}))
+
+print(natal_group_results_maternal)
+
+write.csv(natal_group_results_maternal,
+          file.path(data_dir, "natal_group_icc_results_maternal.csv"),
+          row.names = FALSE)
+```
+
+ outcome                  n icc_mean icc_median  icc_q025 icc_q975
+  <chr>                <int>    <dbl>      <dbl>     <dbl>    <dbl>
+1 mom_groom_proportion    33    0.145     0.0772 0.000261     0.667
+2 mom_prox_proportion     33    0.172     0.0939 0.000125     0.712
+3 mom_groom_eigen_mean    33    0.108     0.0471 0.0000850    0.556
+4 mom_prox_eigen_mean     33    0.180     0.102  0.000534     0.750
+
+## 1b. Posterior-outcome juvenile network metrics
+
+Each son's network position is itself a distribution, drawn from
+`groom_posteriors_juv` / `prox_posteriors_juv` (the same objects loaded in
+script 10). Uses the generic engine above so uncertainty in each son's own
+network-position estimate propagates into the ICC.
+
+```{r test1b-load-posteriors}
+groom_posteriors_juv <- readRDS(file.path(data_dir, "groom_posteriors_juvenile.rds"))
+prox_posteriors_juv  <- readRDS(file.path(data_dir, "prox_posteriors_juvenile.rds"))
+
+# Confirm the $field names below actually match what's stored, e.g.:
+# names(groom_posteriors_juv[[1]])
+# names(prox_posteriors_juv[[1]])
+```
+
+```{r test1b-run}
+juvenile_icc_fields <- list(
+  list(posteriors = groom_posteriors_juv, field = "groom_in_strength_juv",  label = "groom_in_strength_juv"),
+  list(posteriors = groom_posteriors_juv, field = "groom_out_strength_juv", label = "groom_out_strength_juv"),
+  list(posteriors = groom_posteriors_juv, field = "groom_in_degree_juv",    label = "groom_in_degree_juv"),
+  list(posteriors = groom_posteriors_juv, field = "groom_out_degree_juv",   label = "groom_out_degree_juv"),
+  list(posteriors = prox_posteriors_juv,  field = "prox_strength_juv",      label = "prox_strength_juv"),
+  list(posteriors = prox_posteriors_juv,  field = "prox_degree_juv",        label = "prox_degree_juv")
+)
+# NOTE: adjust field names above if they differ from what test1b-load-posteriors
+# confirmed. Set eval=TRUE once confirmed - left off by default since this
+# runs ~1000 brms refits per outcome (6 outcomes here), same scale as one
+# of your existing mediation-analysis chunks.
+
+natal_group_results_posterior <- bind_rows(lapply(juvenile_icc_fields, function(spec) {
+  cat("Fitting natal-group ICC (posterior-propagated) for:", spec$label, "\n")
+  res <- run_posterior_outcome_model(
+    data = emigrants_full_icc,
+    id_col = "Code", posteriors = spec$posteriors, field = spec$field,
+    formula_rhs = "1 + (1 | BirthGp)", num_draws = 1000
+  )
+  icc <- res$pooled$sd_BirthGp__Intercept^2 /
+    (res$pooled$sd_BirthGp__Intercept^2 + res$pooled$sigma^2)
+  tibble(outcome = spec$label, n = res$n, num_draws = res$num_draws,
+         icc_mean = mean(icc), icc_median = median(icc),
+         icc_q025 = quantile(icc, 0.025), icc_q975 = quantile(icc, 0.975))
+}))
+print(natal_group_results_posterior)
+
+write.csv(bind_rows(natal_group_results_fixed, natal_group_results_posterior),
+          file.path(data_dir, "natal_group_icc_results.csv"), row.names = FALSE)
+```
+print(natal_group_results_posterior)
+# A tibble: 6 × 7
+  outcome                    n num_draws icc_mean icc_median icc_q025 icc_q975
+  <chr>                  <int>     <dbl>    <dbl>      <dbl>    <dbl>    <dbl>
+1 groom_in_strength_juv     33      1000    0.349      0.312 0.00195     0.882
+2 groom_out_strength_juv    33      1000    0.282      0.220 0.000783    0.849
+3 groom_in_degree_juv       33      1000    0.706      0.738 0.279       0.966
+4 groom_out_degree_juv      33      1000    0.483      0.491 0.0135      0.927
+5 prox_strength_juv         33      1000    0.692      0.722 0.256       0.969
+6 prox_degree_juv           33      1000    0.879      0.901 0.651       0.988
+
+> print(natal_group_results_posterior)
+# A tibble: 6 × 7
+  outcome                    n num_draws icc_mean icc_median icc_q025 icc_q975
+  <chr>                  <int>     <dbl>    <dbl>      <dbl>    <dbl>    <dbl>
+1 groom_in_strength_juv     33      1000    0.346     0.309  0.00196     0.877
+2 groom_out_strength_juv    33      1000    0.284     0.222  0.000769    0.851
+3 groom_in_degree_juv       33      1000    0.225     0.149  0.000398    0.794
+4 groom_out_degree_juv      33      1000    0.140     0.0659 0.000134    0.669
+5 prox_strength_juv         33      1000    0.690     0.720  0.255       0.968
+6 prox_degree_juv           33      1000    0.642     0.659  0.229       0.958
+
+```{r}
+prox_juv_means <- tibble(
+  Code = names(prox_posteriors_juv),
+  prox_strength_juv = sapply(prox_posteriors_juv, function(x) mean(x$prox_strength_juv)),
+  prox_degree_juv   = sapply(prox_posteriors_juv, function(x) mean(x$prox_degree_juv))
+)
+
+emigrants_full_icc %>%
+  left_join(prox_juv_means, by = "Code") %>%
+  group_by(BirthGp) %>%
+  summarise(n = n(),
+            strength_mean = mean(prox_strength_juv), strength_sd = sd(prox_strength_juv),
+            degree_mean   = mean(prox_degree_juv),   degree_sd   = sd(prox_degree_juv))
+```
+
+
+# Test 2: Immigration group size / sex ratio at dispersal -> male rank & post-dispersal behaviour
+
+Continuous covariates (group size, sex ratio at immigration) rather than
+group x year identity - tests the actual size/sex-ratio hypothesis instead
+of an unidentifiable near-singleton categorical term.
+
+**Note:** `median_group_size` (already in `emigrants_full`) is the median
+size of each male's *natal* group during his *juvenile* window (computed in
+script 8) - it does not answer this question, which is about the
+*destination* group at the moment of immigration. No sex-ratio column
+exists anywhere in `emigrants_full`. Both are built fresh below from
+`group_presence_matrices.rds` (presence, columns = individual `Code`) joined
+to `life_history.csv`'s `Sex` column.
+
+## 2.0 Extract group size and sex ratio at each male's immigration date
+
+```{r test2-extract-context}
+group_presence_matrices <- readRDS(file.path(data_dir, "group_presence_matrices.rds"))
+life_hist <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/life_history.csv")
+
+# Presence matrix columns are lowercase Codes (script 1 does this before
+# building the matrices: life_hist$Code <- tolower(life_hist$Code)) -
+# apply the same transformation here so the join actually matches.
+life_hist$Code <- tolower(life_hist$Code)
+
+sex_lookup <- life_hist %>% distinct(Code, Sex)
+
+# For a given group + date, returns list(group_size, sex_ratio) where
+# sex_ratio = n_females / n_males among everyone present that day (all
+# ages, not adult-restricted - see note below if you want adults only).
+get_group_context <- function(group_name, target_date, presence_matrices, sex_lookup,
+                               max_date_gap = 7) {
+  if (is.na(group_name) || is.na(target_date) || !group_name %in% names(presence_matrices)) {
+    return(list(group_size = NA_real_, sex_ratio = NA_real_))
+  }
+  pm <- presence_matrices[[group_name]]
+  pm$Date <- as.Date(pm$Date)
+
+  row <- pm %>% filter(Date == as.Date(target_date))
+  if (nrow(row) == 0) {
+    # fall back to nearest available date within max_date_gap days
+    pm_near <- pm %>% mutate(gap = abs(as.numeric(Date - as.Date(target_date)))) %>%
+      filter(gap <= max_date_gap) %>% arrange(gap)
+    if (nrow(pm_near) == 0) return(list(group_size = NA_real_, sex_ratio = NA_real_))
+    row <- pm_near[1, ]
+  }
+
+  present_codes <- names(row)[-1][as.logical(as.numeric(row[1, -1]))]
+  present_codes <- setdiff(present_codes, c("gap"))  # in case fallback row carries it
+
+  sexes <- sex_lookup$Sex[match(present_codes, sex_lookup$Code)]
+  n_f <- sum(sexes == "F", na.rm = TRUE)
+  n_m <- sum(sexes == "M", na.rm = TRUE)
+
+  if (n_f == 0 && n_m == 0 && length(present_codes) > 0) {
+    warning("Sex lookup matched 0 of ", length(present_codes),
+            " present individuals for group ", group_name, " - check Code format")
+  }
+
+  list(group_size = length(present_codes),
+       sex_ratio = if (n_m > 0) n_f / n_m else NA_real_)
+}
+
+emigrants_full <- emigrants_full %>%
+  rowwise() %>%
+  mutate(
+    context = list(get_group_context(ImmigrationGp1, DateImmigration1,
+                                      group_presence_matrices, sex_lookup)),
+    group_size_at_immigration = context$group_size,
+    sex_ratio_at_immigration  = context$sex_ratio
+  ) %>%
+  ungroup() %>%
+  select(-context)
+
+cat("group_size_at_immigration coverage:", sum(!is.na(emigrants_full$group_size_at_immigration)), "/", nrow(emigrants_full), "\n")
+cat("sex_ratio_at_immigration coverage:", sum(!is.na(emigrants_full$sex_ratio_at_immigration)), "/", nrow(emigrants_full), "\n")
+summary(emigrants_full$group_size_at_immigration)
+summary(emigrants_full$sex_ratio_at_immigration)
+```
+
+> cat("group_size_at_immigration coverage:", sum(!is.na(emigrants_full$group_size_at_immigration)), "/", nrow(emigrants_full), "\n")
+group_size_at_immigration coverage: 157 / 212 
+> cat("sex_ratio_at_immigration coverage:", sum(!is.na(emigrants_full$sex_ratio_at_immigration)), "/", nrow(emigrants_full), "\n")
+sex_ratio_at_immigration coverage: 157 / 212 
+> summary(emigrants_full$group_size_at_immigration)
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max.     NAs 
+   7.00   33.00   40.00   41.15   48.00   76.00      55 
+> summary(emigrants_full$sex_ratio_at_immigration)
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max.     NAs 
+ 0.5833  0.9231  1.1000  1.1797  1.3333  3.0000      55 
+
+
+This computes `sex_ratio_at_immigration` as females-per-male among
+*everyone present* that day (all ages) - a simpler, immediately-computable
+version. If you want it restricted to *adults only* (matching the
+`get_age_class()` AM/AF logic already used in script 1), that needs each
+present individual's age at that date too - say the word and I'll extend
+this to reuse that classification.
+
+## 2a. Fixed-value outcome (post-dispersal rank)
+
+```{r test2a-fixed}
+fit_dispersal_context_fixed <- function(outcome, data, predictors) {
+  predictors <- predictors[predictors %in% names(data)]
+  if (length(predictors) == 0) stop("None of the requested predictor columns were found")
+  f <- bf(as.formula(paste0(outcome, " ~ ", paste(predictors, collapse = " + "))))
+  brm(f, data = data, family = gaussian(), chains = 2, iter = 2000, warmup = 1000,
+      seed = 1, refresh = 0, silent = 2, control = list(adapt_delta = 0.95))
+}
+
+fit_rank_context <- fit_dispersal_context_fixed(
+  "elo_one_year_male_male",
+  emigrants_full %>% filter(Code %in% mediation_sample_codes),
+  predictors = c("group_size_at_immigration", "sex_ratio_at_immigration")
+)
+summary(fit_rank_context)
+```
+
+> summary(fit_rank_context)
+ Family: gaussian 
+  Links: mu = identity 
+Formula: elo_one_year_male_male ~ group_size_at_immigration + sex_ratio_at_immigration 
+   Data: data (Number of observations: 33) 
+  Draws: 2 chains, each with iter = 2000; warmup = 1000; thin = 1;
+         total post-warmup draws = 2000
+
+Regression Coefficients:
+                          Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+Intercept                     0.48      0.33    -0.15     1.11 1.00     2816     1263
+group_size_at_immigration    -0.00      0.00    -0.01     0.01 1.00     2716     1555
+sex_ratio_at_immigration      0.03      0.25    -0.45     0.52 1.00     2059     1421
+
+Further Distributional Parameters:
+      Estimate Est.Error l-95% CI u-95% CI Rhat Bulk_ESS Tail_ESS
+sigma     0.37      0.05     0.29     0.49 1.00     1682     1348
+
+Draws were sampled using sampling(NUTS). For each parameter, Bulk_ESS
+and Tail_ESS are effective sample size measures, and Rhat is the potential
+scale reduction factor on split chains (at convergence, Rhat = 1).
+
+## 2b. Posterior-outcome: post-dispersal network metrics (all six)
+
+Uses the same engine as Test 1b, with the ADULT posteriors
+(`prox_posteriors.rds` / `groom_posteriors.rds`) as the outcome, regressed
+on group size / sex ratio at immigration - looped across every network
+metric rather than just `prox_strength`.
+
+```{r test2b-posterior}
+prox_posteriors  <- readRDS(file.path(data_dir, "prox_posteriors.rds"))
+groom_posteriors <- readRDS(file.path(data_dir, "groom_posteriors.rds"))
+
+# Confirm these field names match what's actually stored before trusting
+# the loop below, same caveat as Test 1b:
+# names(prox_posteriors[[1]]); names(groom_posteriors[[1]])
+adult_network_fields <- list(
+  list(posteriors = prox_posteriors,  field = "prox_strength",       label = "prox_strength"),
+  list(posteriors = prox_posteriors,  field = "prox_degree",         label = "prox_degree"),
+  list(posteriors = groom_posteriors, field = "groom_in_strength",   label = "groom_in_strength"),
+  list(posteriors = groom_posteriors, field = "groom_out_strength",  label = "groom_out_strength"),
+  list(posteriors = groom_posteriors, field = "groom_in_degree",     label = "groom_in_degree"),
+  list(posteriors = groom_posteriors, field = "groom_out_degree",    label = "groom_out_degree")
+)
+# NOTE: this runs ~1000 brms refits per outcome (6 outcomes) - same scale
+# as Test 1b and one of your existing mediation-analysis chunks.
+
+dispersal_context_results <- bind_rows(lapply(adult_network_fields, function(spec) {
+  cat("Fitting dispersal-context model for:", spec$label, "\n")
+  res <- run_posterior_outcome_model(
+    data = emigrants_full %>% filter(Code %in% mediation_sample_codes), id_col = "Code",
+    posteriors = spec$posteriors, field = spec$field,
+    formula_rhs = "group_size_at_immigration + sex_ratio_at_immigration",
+    num_draws = 1000
+  )
+  tibble(
+    outcome = spec$label,
+    term = c("group_size_at_immigration", "sex_ratio_at_immigration"),
+    n = res$n, num_draws = res$num_draws,
+    mean = c(mean(res$pooled$b_group_size_at_immigration), mean(res$pooled$b_sex_ratio_at_immigration)),
+    q025 = c(quantile(res$pooled$b_group_size_at_immigration, .025), quantile(res$pooled$b_sex_ratio_at_immigration, .025)),
+    q975 = c(quantile(res$pooled$b_group_size_at_immigration, .975), quantile(res$pooled$b_sex_ratio_at_immigration, .975))
+  )
+}))
+print(dispersal_context_results, n = Inf)
+
+write.csv(dispersal_context_results,
+          file.path(data_dir, "dispersal_context_network_results.csv"), row.names = FALSE)
+```
+
+print(dispersal_context_results, n = Inf)
+# A tibble: 12 × 7
+   outcome            term                          n num_draws       mean      q025    q975
+   <chr>              <chr>                     <int>     <dbl>      <dbl>     <dbl>   <dbl>
+ 1 prox_strength      group_size_at_immigration    33      1000  0.00104   -0.000991 0.00292
+ 2 prox_strength      sex_ratio_at_immigration     33      1000 -0.0000475 -0.105    0.0976 
+ 3 prox_degree        group_size_at_immigration    33      1000  0.00237   -0.00247  0.00722
+ 4 prox_degree        sex_ratio_at_immigration     33      1000  0.136     -0.125    0.398  
+ 5 groom_in_strength  group_size_at_immigration    33      1000  0.000199  -0.00281  0.00319
+ 6 groom_in_strength  sex_ratio_at_immigration     33      1000  0.336      0.176    0.496  
+ 7 groom_out_strength group_size_at_immigration    33      1000 -0.00121   -0.00432  0.00188
+ 8 groom_out_strength sex_ratio_at_immigration     33      1000  0.357      0.188    0.525  
+ 9 groom_in_degree    group_size_at_immigration    33      1000  0.00274   -0.00107  0.00655
+10 groom_in_degree    sex_ratio_at_immigration     33      1000  0.556      0.351    0.761  
+11 groom_out_degree   group_size_at_immigration    33      1000  0.000193  -0.00444  0.00482
+12 groom_out_degree   sex_ratio_at_immigration     33      1000  0.528      0.278    0.778
+

@@ -1,0 +1,44 @@
+---
+title: "4.Put_all_data_together"
+author: "Alba Motes Rodrigo"
+date: "2026-03-20"
+output: html_document
+---
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# Merge everything: emigrants + proximity metrics + grooming metrics
+# ══════════════════════════════════════════════════════════════════════
+# Read proximity metrics (from the earlier script)
+proximity_metrics <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/network_mets_prox_bayes.csv"
+)
+ 
+emigrants <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/All_potential_immigrants_Josie_version.csv")
+
+# Merge proximity into emigrants
+emigrants_full <- emigrants %>%
+  left_join(
+    proximity_metrics %>% select(-group, -start_date, -end_date),
+    by = "Code",
+    suffix = c("", "_prox")
+  )
+
+grooming_metrics<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/network_mets_groom_bayes.csv")
+
+# Merge grooming into emigrants
+emigrants_full <- emigrants_full %>%
+  left_join(
+    grooming_metrics %>% select(-group, -start_date, -end_date),
+    by = "Code",
+    suffix = c("", "_groom")
+  )
+ 
+cat("Final merged dataset:", nrow(emigrants_full), "rows,", ncol(emigrants_full), "columns\n")
+ 
+
+write.csv(emigrants_full,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/emigrants_full_merged.csv",
+          row.names = FALSE)
+```
+n_total n_maternal_elo n_own_elo_all n_prox_strength n_groom_strength n_all_measures
+1     163             44           122             119              120             28

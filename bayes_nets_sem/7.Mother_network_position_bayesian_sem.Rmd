@@ -1,0 +1,766 @@
+---
+title: "8. Mother_network_position_v5_bayesian"
+author: "Alba Motes Rodrigo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+Restructured to follow the same joint-Bayesian analytical pipeline as
+scripts 5v5 (maternal rank) and 7v6 (maternal investment), replacing the
+previous lm() + bootstrap + mclapply approach with a joint multivariate
+brm() model, compiled once and update()'d per network draw. As in those
+scripts, this is run as TWO sequential full-run pipelines - one per
+mother-network-position predictor (mom_groom_eigen, mom_prox_eigen) -
+each looping over a shared mediator_specs list, with its own sem_data,
+TEST chunk, and FULL RUN chunk with PARTIAL saves, combined into a
+single final output at the end.
+
+Predictor = mother's own eigenvector centrality in her proximity and
+grooming networks (Beta-Binomial posteriors, extraction logic unchanged
+from the previous version of this script). Mediator = son's own raw
+social network metrics - the same 6 mediators used in scripts 5v5/7v6
+(prox_strength, prox_degree, groom_out_strength, groom_in_strength,
+groom_out_degree, groom_in_degree), NOT the PC1/PC2 composite scores
+used in the earlier version of this script. REQUIRES prox_posteriors.rds
+and groom_posteriors.rds to already exist.
+
+THREE FIXES APPLIED (matching scripts 5v5/7v6's validated corrections,
+plus one specific to this script):
+
+  1. The previous version used weights = obs_weight inside lm(), which
+     is a FREQUENCY-type weight (as if an observation with weight 0.25
+     contributes a quarter of a full observation), not a
+     measurement-precision downweighting. FIXED: sigma ~ obs_weight
+     (heteroscedastic/distributional regression) is now used in BOTH
+     equations of the joint brms model instead.
+
+  2. The previous version fit mediator and outcome equations as two
+     SEPARATE lm() calls per bootstrap replicate, which does not yield
+     a genuine joint posterior over (a, b, c'). FIXED: both equations
+     are now fit as ONE joint multivariate brms model (bf_mediator +
+     bf_outcome), so a, b, c' are drawn together, properly paired, from
+     the same MCMC draws each network-draw iteration.
+
+  3. Uncertainty was previously represented via a nonparametric
+     bootstrap (n_boot = 500 resamples) nested inside each of 1,000
+     network draws (500,000 total lm() fits per predictor-mediator
+     pair). FIXED: the bootstrap is dropped entirely - posterior
+     uncertainty now comes directly from the joint brms model's own
+     MCMC draws, combined across network draws, exactly as in scripts
+     5v5/7v6. This also removes the need for mclapply parallelization
+     inside the mediation function (the compile-once-then-update()
+     pattern is itself the runtime-saving device here).
+
+Residual correlation (set_rescor) is NOT included - consistent with
+scripts 5v5/7v6, where it was tested and found not well identified at
+comparable sample sizes.
+
+Convergence must be checked via summarise_draws(as_draws_df(fit)), NOT
+posterior::ess_bulk(as_draws_array(fit)) - the latter returned spurious
+NA/near-zero values during validation testing in script 5v5.
+
+Note: unlike scripts 5v5/7v6, BOTH the predictor (mother's eigenvector
+centrality) and the mediator (son's network metric) are posterior-derived
+here, so build_draw_data() draws both from their respective posterior
+lists on each iteration k, rather than only the mediator.
+
+Outcome column is elo_one_year_male_male, matching scripts 5v5/7v6
+(changed from elo_one_year_all used in the earlier version of this
+script).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+library(dplyr)
+library(tibble)
+library(igraph)
+library(ggplot2)
+library(tidyr)
+library(brms)
+library(posterior)
+```
+
+# Load data
+
+```{r load-data}
+emigrants_full <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/emigrants_full_merged.csv"
+)
+
+grooming_data <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/grooming_data2010_2025.csv"
+)
+
+scans <- read.csv(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scans_for_bison.csv"
+)
+
+prox_posteriors <- readRDS(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/prox_posteriors.rds"
+)
+groom_posteriors <- readRDS(
+  "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/groom_posteriors.rds"
+)
+
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Analyses/scan_extraction_1mandarm.R")
+
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK",
+                          "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing" = "CR",
+                          "IFamily" = "IF")
+
+grooming_data$date <- as.Date(grooming_data$date)
+grooming_data$idindividual1 <- tolower(as.character(grooming_data$idindividual1))
+grooming_data$idindividual2 <- tolower(as.character(grooming_data$idindividual2))
+grooming_data$group_Abbreviation <- group_abbreviations[grooming_data$group]
+
+emigrants_full$Code <- tolower(emigrants_full$Code)
+emigrants_full$Momcode <- tolower(emigrants_full$Momcode)
+emigrants_full$DOB <- as.Date(emigrants_full$DOB)
+emigrants_full$juvenile_period_end <- as.Date(emigrants_full$juvenile_period_end)
+emigrants_full$DateImmigration1 <- as.Date(emigrants_full$DateImmigration1)
+emigrants_full$LastSeen1 <- as.Date(emigrants_full$LastSeen1)
+```
+
+# Compute observation weight (used as a sigma predictor)
+
+```{r compute-weight}
+emigrants_full <- emigrants_full %>%
+  mutate(
+    start_date_effective = if_else(!is.na(DateImmigration1),
+                                    as.Date(DateImmigration1),
+                                    as.Date(DepartureNatalGp)),
+    window_end = start_date_effective + 365,
+    effective_end = if_else(!is.na(LastSeen1) & LastSeen1 < window_end,
+                             LastSeen1, window_end),
+    days_present_first_year = pmin(as.numeric(effective_end - start_date_effective), 365),
+    obs_weight = days_present_first_year / 365
+  )
+```
+
+# 1. Extract mother's eigenvector centrality (Beta-Binomial posteriors)
+
+```{r eigen-metrics-function}
+compute_eigen_from_posterior <- function(dyadic_data, all_nodes, focal_node,
+                                          num_draws = 1000,
+                                          prior_a = 0.1, prior_b = 0.1,
+                                          edge_thresh = 0.0001) {
+
+  n_dyads <- nrow(dyadic_data)
+  n_nodes <- length(all_nodes)
+
+  draw_mat <- matrix(NA, nrow = n_dyads, ncol = num_draws)
+  for (d in 1:n_dyads) {
+    draw_mat[d, ] <- rbeta(num_draws,
+                            prior_a + dyadic_data$event[d],
+                            prior_b + dyadic_data$duration[d] - dyadic_data$event[d])
+  }
+
+  node1 <- as.character(dyadic_data$node_1)
+  node2 <- as.character(dyadic_data$node_2)
+
+  eigen_draws <- numeric(num_draws)
+
+  for (k in 1:num_draws) {
+    adj <- matrix(0, n_nodes, n_nodes, dimnames = list(all_nodes, all_nodes))
+    for (r in 1:n_dyads) {
+      w <- draw_mat[r, k]
+      if (w < edge_thresh) w <- 0
+      adj[node1[r], node2[r]] <- w
+      adj[node2[r], node1[r]] <- w
+    }
+    g <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected", weighted = TRUE)
+    ec <- tryCatch(igraph::eigen_centrality(g, weights = igraph::E(g)$weight)$vector,
+                    error = function(e) setNames(rep(NA, n_nodes), all_nodes))
+    eigen_draws[k] <- ec[focal_node]
+  }
+
+  eigen_draws
+}
+```
+
+```{r mother-window-helper}
+get_mother_windows <- function(sons_data) {
+  sons_data %>%
+    filter(!is.na(Momcode), !is.na(DOB), !is.na(juvenile_period_end), !is.na(BirthGp)) %>%
+    distinct(Momcode, BirthGp, DOB, juvenile_period_end)
+}
+```
+
+```{r mother-grooming-eigen-extraction}
+extract_mother_grooming_eigen <- function(grooming_data, mother_windows, num_draws = 1000) {
+
+  results <- list()
+  posterior_draws <- list()
+
+  for (i in seq_len(nrow(mother_windows))) {
+
+    mom_code   <- mother_windows$Momcode[i]
+    group_name <- mother_windows$BirthGp[i]
+    win_start  <- mother_windows$DOB[i]
+    win_end <- mother_windows$juvenile_period_end[i]
+
+    window_groom <- grooming_data %>%
+      filter(group_Abbreviation == group_name, date >= win_start, date <= win_end)
+
+    if (nrow(window_groom) == 0) next
+
+    indiv_days <- window_groom %>%
+      tidyr::pivot_longer(cols = c(idindividual1, idindividual2), values_to = "individual") %>%
+      group_by(individual) %>%
+      summarise(days_observed = n_distinct(date), .groups = "drop")
+
+    dyadic_data <- window_groom %>%
+      filter(idindividual1 != "", idindividual2 != "", !is.na(idindividual1), !is.na(idindividual2)) %>%
+      mutate(node_1 = pmin(idindividual1, idindividual2), node_2 = pmax(idindividual1, idindividual2)) %>%
+      filter(node_1 != node_2) %>%
+      group_by(node_1, node_2) %>%
+      summarise(event = n_distinct(date), .groups = "drop") %>%
+      left_join(indiv_days, by = c("node_1" = "individual")) %>% rename(days_1 = days_observed) %>%
+      left_join(indiv_days, by = c("node_2" = "individual")) %>% rename(days_2 = days_observed) %>%
+      mutate(duration = days_1 + days_2 - event)
+
+    if (nrow(dyadic_data) == 0 || !mom_code %in% c(dyadic_data$node_1, dyadic_data$node_2)) next
+
+    all_nodes <- unique(c(dyadic_data$node_1, dyadic_data$node_2))
+
+    tryCatch({
+      eigen_draws <- compute_eigen_from_posterior(dyadic_data, all_nodes, mom_code, num_draws)
+
+      key <- paste(mom_code, group_name, win_start, sep = "_")
+      posterior_draws[[key]] <- list(mom_groom_eigen = eigen_draws)
+
+      results[[i]] <- tibble(Momcode = mom_code, BirthGp = group_name, DOB = win_start,
+                              mom_groom_eigen_mean = mean(eigen_draws, na.rm = TRUE),
+                              n_dyads_mom_groom = nrow(dyadic_data))
+
+      message("Done (grooming eigen): mother ", mom_code)
+    }, error = function(e) message("Error (grooming) for mother ", mom_code, ": ", e$message))
+  }
+
+  list(summaries = bind_rows(results), posteriors = posterior_draws)
+}
+```
+
+```{r mother-proximity-eigen-extraction}
+extract_mother_proximity_eigen <- function(scans, mother_windows, num_draws = 1000) {
+
+  results <- list()
+  posterior_draws <- list()
+
+  for (i in seq_len(nrow(mother_windows))) {
+
+    mom_code   <- mother_windows$Momcode[i]
+    group_name <- mother_windows$BirthGp[i]
+    win_start  <- mother_windows$DOB[i]
+    win_end <- mother_windows$juvenile_period_end[i]
+
+    scans_filtered <- scans %>%
+      mutate(date = as.Date(date)) %>%
+      filter(group_Abbreviation == group_name, date >= win_start, date <= win_end)
+
+    if (nrow(scans_filtered) == 0) next
+
+    proximity_data <- extract_proximity_pairs(scans_filtered)
+    if (is.null(proximity_data) || nrow(proximity_data) == 0) next
+
+    individual_scan_counts <- bind_rows(
+      scans_filtered %>% filter(!is.na(idindividual1), idindividual1 != "") %>%
+        distinct(idindividual1, scan_id) %>% rename(individual = idindividual1),
+      proximity_data %>% filter(!is.na(interaction_partner), interaction_partner != "") %>%
+        distinct(interaction_partner, scan_id) %>% rename(individual = interaction_partner)
+    ) %>% distinct() %>% group_by(individual) %>%
+      summarise(scans_sampled = n_distinct(scan_id), .groups = "drop")
+
+    dyadic_data <- proximity_data %>%
+      filter(!is.na(idindividual1), idindividual1 != "", !is.na(interaction_partner), interaction_partner != "") %>%
+      mutate(node_1 = pmin(idindividual1, interaction_partner), node_2 = pmax(idindividual1, interaction_partner)) %>%
+      filter(node_1 != node_2) %>%
+      group_by(node_1, node_2) %>%
+      summarise(event = n_distinct(scan_id), .groups = "drop") %>%
+      left_join(individual_scan_counts, by = c("node_1" = "individual")) %>% rename(scans_node_1 = scans_sampled) %>%
+      left_join(individual_scan_counts, by = c("node_2" = "individual")) %>% rename(scans_node_2 = scans_sampled) %>%
+      mutate(duration = scans_node_1 + scans_node_2 - event)
+
+    if (nrow(dyadic_data) == 0 || !mom_code %in% c(dyadic_data$node_1, dyadic_data$node_2)) next
+
+    all_nodes <- unique(c(dyadic_data$node_1, dyadic_data$node_2))
+
+    tryCatch({
+      eigen_draws <- compute_eigen_from_posterior(dyadic_data, all_nodes, mom_code, num_draws)
+
+      key <- paste(mom_code, group_name, win_start, sep = "_")
+      posterior_draws[[key]] <- list(mom_prox_eigen = eigen_draws)
+
+      results[[i]] <- tibble(Momcode = mom_code, BirthGp = group_name, DOB = win_start,
+                              mom_prox_eigen_mean = mean(eigen_draws, na.rm = TRUE),
+                              n_dyads_mom_prox = nrow(dyadic_data))
+
+      message("Done (proximity eigen): mother ", mom_code)
+    }, error = function(e) message("Error (proximity) for mother ", mom_code, ": ", e$message))
+  }
+
+  list(summaries = bind_rows(results), posteriors = posterior_draws)
+}
+```
+
+```{r run-mother-eigen-extraction}
+mother_windows <- get_mother_windows(emigrants_full)
+cat("Unique mother-windows to process:", nrow(mother_windows), "\n") #80
+
+mother_groom_eigen <- extract_mother_grooming_eigen(grooming_data, mother_windows, num_draws = 1000)
+mother_prox_eigen  <- extract_mother_proximity_eigen(scans, mother_windows, num_draws = 1000)
+
+cat("Mothers with grooming eigenvector centrality:", nrow(mother_groom_eigen$summaries), "\n")
+cat("Mothers with proximity eigenvector centrality:", nrow(mother_prox_eigen$summaries), "\n")
+
+mother_groom_eigen_posteriors <- mother_groom_eigen$posteriors
+mother_prox_eigen_posteriors  <- mother_prox_eigen$posteriors
+
+# Join the mother eigenvector centrality summaries onto emigrants_full
+emigrants_full <- emigrants_full %>%
+  left_join(mother_groom_eigen$summaries, by = c("Momcode", "BirthGp", "DOB")) %>%
+  left_join(mother_prox_eigen$summaries,  by = c("Momcode", "BirthGp", "DOB"))
+
+# Confirm the join worked before saving
+sum(!is.na(emigrants_full$mom_groom_eigen_mean))
+sum(!is.na(emigrants_full$mom_prox_eigen_mean))
+
+# Save the updated emigrants_full with these two new columns
+write.csv(emigrants_full,
+          file.path("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/emigrants_full_merged.csv"),
+          row.names = FALSE)
+saveRDS(mother_groom_eigen_posteriors,
+        "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/mother_groom_eigen_posteriors.rds")
+saveRDS(mother_prox_eigen_posteriors,
+        "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/mother_prox_eigen_posteriors.rds")
+```
+
+# 2. Build sem_data (one per predictor, mirrors mom_key matching)
+
+Both predictors are keyed to mother-windows (Momcode + birth-group +
+DOB), not directly to Code, so each son is matched to his mother's
+eigen-centrality posterior via the mom_key prefix-match used in the
+original script. This is done once per predictor here (matching scripts
+5v5/7v6's pattern of building sem_data before the mediation function),
+rather than inside the mediation function on every call.
+
+```{r build-sem-data-function}
+build_predictor_sem_data <- function(emigrants_full, predictor_posteriors) {
+  emigrants_full %>%
+    mutate(mom_key_prefix = paste0(Momcode, "_")) %>%
+    rowwise() %>%
+    mutate(mom_key = {
+      matches <- names(predictor_posteriors)[startsWith(names(predictor_posteriors), mom_key_prefix)]
+      if (length(matches) == 0) NA_character_ else matches[1]
+    }) %>%
+    ungroup() %>%
+    filter(!is.na(mom_key), !is.na(elo_one_year_male_male), !is.na(obs_weight))
+}
+```
+
+```{r build-sem-data}
+sem_data_mom_groom_eigen <- build_predictor_sem_data(emigrants_full, mother_groom_eigen_posteriors)
+sem_data_mom_prox_eigen  <- build_predictor_sem_data(emigrants_full, mother_prox_eigen_posteriors)
+
+cat("Sample size for mother-grooming-eigen SEM:", nrow(sem_data_mom_groom_eigen), "\n")#38
+cat("Sample size for mother-proximity-eigen SEM:", nrow(sem_data_mom_prox_eigen), "\n")#38
+```
+
+# 3. Mediator specifications (shared across both predictor pipelines)
+
+```{r mediator-specs}
+mediator_specs <- list(
+  list(name = "prox_strength",      posteriors = prox_posteriors,  field = "prox_strength"),
+  list(name = "prox_degree",        posteriors = prox_posteriors,  field = "prox_degree"),
+  list(name = "groom_out_strength", posteriors = groom_posteriors, field = "groom_out_strength"),
+  list(name = "groom_in_strength",  posteriors = groom_posteriors, field = "groom_in_strength"),
+  list(name = "groom_out_degree",   posteriors = groom_posteriors, field = "groom_out_degree"),
+  list(name = "groom_in_degree",    posteriors = groom_posteriors, field = "groom_in_degree")
+)
+```
+
+# 4. Summary helper
+
+```{r summarize-network-draws-function}
+summarize_network_draws <- function(estimates) {
+  tibble(
+    estimate_mean   = mean(estimates),
+    estimate_median = median(estimates),
+    network_q025    = quantile(estimates, 0.025, names = FALSE),
+    network_q975    = quantile(estimates, 0.975, names = FALSE),
+    prop_positive   = mean(estimates > 0),
+    prop_negative   = mean(estimates < 0)
+  )
+}
+```
+
+# 5. Convergence check helper (uses the VALIDATED reliable method)
+
+```{r convergence-check-function}
+check_joint_convergence <- function(fit, rhat_threshold = 1.01, ess_threshold = 400) {
+  summ <- summarise_draws(as_draws_df(fit))
+  bad_rhat <- summ %>% filter(rhat > rhat_threshold)
+  bad_ess  <- summ %>% filter(ess_bulk < ess_threshold | ess_tail < ess_threshold)
+
+  ok <- nrow(bad_rhat) == 0 && nrow(bad_ess) == 0
+
+  if (!ok) {
+    cat("    CONVERGENCE WARNING:\n")
+    if (nrow(bad_rhat) > 0) {
+      cat("    Parameters with Rhat >", rhat_threshold, ":\n")
+      print(bad_rhat %>% select(variable, rhat))
+    }
+    if (nrow(bad_ess) > 0) {
+      cat("    Parameters with ESS <", ess_threshold, ":\n")
+      print(bad_ess %>% select(variable, ess_bulk, ess_tail))
+    }
+  }
+
+  list(ok = ok, max_rhat = max(summ$rhat, na.rm = TRUE),
+       min_ess = min(c(summ$ess_bulk, summ$ess_tail), na.rm = TRUE))
+}
+```
+
+# 6. Joint Bayesian mediation function (compile once, update() per draw)
+
+Same internal logic as scripts 5v5/7v6's mediation function, generalized
+only in that BOTH predictor_raw and mediator_raw are re-drawn from their
+respective posterior lists on every iteration k (since both mother's
+eigen-centrality and son's PC score are posterior-derived here, unlike
+scripts 5v5/7v6 where only the mediator varied by draw).
+
+```{r joint-bayesian-mediation-function}
+run_mother_eigen_mediation_bayesian_joint <- function(sem_data, predictor_posteriors, predictor_field, predictor_label,
+                                                        spec, num_draws, chains = 2, iter = 2000, warmup = 1000,
+                                                        adapt_delta = 0.95) {
+
+  cat("Running JOINT BAYESIAN mediation:", predictor_label, "->", spec$name, "\n")
+
+  males_with_mediator <- sem_data$Code[sem_data$Code %in% names(spec$posteriors)]
+  dat <- sem_data %>% filter(Code %in% males_with_mediator)
+
+  if (nrow(dat) < 10) {
+    cat("  Too few males with posteriors:", nrow(dat), "— skipping\n")
+    return(NULL)
+  }
+  cat("  Males with all data:", nrow(dat), "\n")
+
+  first_predictor_post <- predictor_posteriors[[dat$mom_key[1]]][[predictor_field]]
+  first_mediator_post  <- spec$posteriors[[dat$Code[1]]][[spec$field]]
+  actual_draws <- min(length(first_predictor_post), length(first_mediator_post))
+  num_draws <- min(num_draws, actual_draws)
+
+  predictor_point_estimates <- sapply(dat$mom_key, function(key) {
+    mean(predictor_posteriors[[key]][[predictor_field]][1:num_draws], na.rm = TRUE)
+  })
+  predictor_center <- mean(predictor_point_estimates, na.rm = TRUE)
+  predictor_scale   <- sd(predictor_point_estimates, na.rm = TRUE)
+
+  mediator_point_estimates <- sapply(dat$Code, function(id) {
+    mean(spec$posteriors[[id]][[spec$field]][1:num_draws])
+  })
+  mediator_center <- mean(mediator_point_estimates)
+  mediator_scale   <- sd(mediator_point_estimates)
+
+  build_draw_data <- function(k) {
+    dat_k <- dat
+    dat_k$predictor_raw <- sapply(dat_k$mom_key, function(key) predictor_posteriors[[key]][[predictor_field]][k])
+    dat_k$mediator_raw  <- sapply(dat_k$Code,    function(id)  spec$posteriors[[id]][[spec$field]][k])
+    dat_k$predictor_z   <- (dat_k$predictor_raw - predictor_center) / predictor_scale
+    dat_k$mediator_z    <- (dat_k$mediator_raw  - mediator_center)  / mediator_scale
+    dat_k$male_elo_z    <- scale(dat_k$elo_one_year_male_male)[, 1]
+    dat_k
+  }
+
+  dat_1 <- build_draw_data(1)
+
+  # ── Validated joint model structure: heteroscedastic sigma ~ obs_weight
+  # in both equations, NO residual correlation (not well identified at
+  # comparable n - see script 5v5 for validation testing details) ────────
+  bf_mediator <- bf(mediator_z ~ predictor_z, sigma ~ obs_weight)
+  bf_outcome  <- bf(male_elo_z ~ mediator_z + predictor_z, sigma ~ obs_weight)
+
+  cat("  Compiling joint Stan model (draw 1)...\n")
+  t0 <- Sys.time()
+
+  fit_base <- brm(
+    bf_mediator + bf_outcome + set_rescor(FALSE),
+    data = dat_1, family = gaussian(),
+    chains = chains, iter = iter, warmup = warmup,
+    seed = 1, refresh = 0, silent = 2,
+    control = list(adapt_delta = adapt_delta)
+  )
+
+  compile_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  cat("  Compilation + first fit took", round(compile_time, 1), "seconds\n")
+
+  # Check convergence on draw 1 before proceeding - if this fails, no
+  # point continuing to 1,000 more draws with the same problem
+  conv1 <- check_joint_convergence(fit_base)
+  if (!conv1$ok) {
+    cat("  WARNING: draw 1 did not converge cleanly (max Rhat =",
+        round(conv1$max_rhat, 4), ", min ESS =", round(conv1$min_ess, 1), ") - inspect before proceeding\n")
+  }
+
+  a_all <- numeric(0); b_all <- numeric(0); c_all <- numeric(0); ind_all <- numeric(0)
+
+  for (k in 1:num_draws) {
+
+    dat_k <- if (k == 1) dat_1 else build_draw_data(k)
+
+    fit_k <- if (k == 1) fit_base else update(fit_base, newdata = dat_k, recompile = FALSE, refresh = 0, silent = 2)
+
+    post_k <- as_draws_df(fit_k)
+
+    a_post   <- post_k$b_mediatorz_predictor_z
+    b_post   <- post_k$b_maleeloz_mediator_z
+    c_post   <- post_k$b_maleeloz_predictor_z
+    ind_post <- a_post * b_post   # genuinely paired within-draw, from one joint posterior
+
+    a_all   <- c(a_all, a_post)
+    b_all   <- c(b_all, b_post)
+    c_all   <- c(c_all, c_post)
+    ind_all <- c(ind_all, ind_post)
+  }
+
+  results <- bind_rows(
+    summarize_network_draws(a_all)   %>% mutate(path = "a (mom eigen -> son network mediator)"),
+    summarize_network_draws(b_all)   %>% mutate(path = "b (son network mediator -> male elo)"),
+    summarize_network_draws(c_all)   %>% mutate(path = "c' (mom eigen -> male elo, direct)"),
+    summarize_network_draws(ind_all) %>% mutate(path = "indirect (a * b)")
+  ) %>%
+    mutate(predictor = predictor_label, mediator = spec$name, n = nrow(dat),
+           num_draws = num_draws, .before = 1)
+
+  cat("\n  === Joint Bayesian results:", predictor_label, "->", spec$name,
+      "(n =", nrow(dat), ",", num_draws, "network draws) ===\n")
+  for (j in 1:nrow(results)) {
+    cat(sprintf("  %-35s posterior mean = %6.3f  95%% interval [%6.3f, %6.3f]  %4.1f%% pos\n",
+                results$path[j], results$estimate_mean[j],
+                results$network_q025[j], results$network_q975[j],
+                results$prop_positive[j] * 100))
+  }
+  cat("\n")
+
+  list(
+    summary = results,
+    pooled_posterior = tibble(a = a_all, b = b_all, c_prime = c_all, indirect = ind_all),
+    draw1_convergence = conv1
+  )
+}
+```
+
+# 7. TEST FIRST: mother grooming eigen, one mediator, small number of draws
+
+```{r test-small-run-groom-eigen, eval=FALSE}
+test_spec <- mediator_specs[[5]]  # groom_out_degree - matches the validated test used in scripts 5v5/7v6
+
+t0 <- Sys.time()
+test_out_groom_eigen <- run_mother_eigen_mediation_bayesian_joint(
+  sem_data_mom_groom_eigen, mother_groom_eigen_posteriors, "mom_groom_eigen", "Mother grooming eigen-centrality",
+  test_spec, num_draws = 5, chains = 2, iter = 2000, warmup = 1000
+)
+total_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+cat("\n=== TIMING TEST (mother grooming eigen) ===\n")
+cat("Total time for 5 draws:", round(total_time, 1), "seconds\n")
+cat("Draw 1 convergence: max Rhat =", round(test_out_groom_eigen$draw1_convergence$max_rhat, 4),
+    ", min ESS =", round(test_out_groom_eigen$draw1_convergence$min_ess, 1), "\n")
+
+print(as.data.frame(test_out_groom_eigen$summary), row.names = FALSE)
+```
+
+# 8. FULL RUN — mother grooming eigen-centrality (only after confirming timing + convergence above)
+
+```{r run-full-bayesian-groom-eigen, eval=T}
+all_results_groom_eigen <- list()
+all_pooled_groom_eigen   <- list()
+
+for (spec in mediator_specs) {
+
+  cat("\n>>> Starting mom_groom_eigen ->", spec$name, "at", format(Sys.time()), "\n")
+
+  out <- tryCatch(
+    run_mother_eigen_mediation_bayesian_joint(
+      sem_data_mom_groom_eigen, mother_groom_eigen_posteriors, "mom_groom_eigen", "Mother grooming eigen-centrality",
+      spec, num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+    ),
+    error = function(e) {
+      cat("  ERROR for mom_groom_eigen ->", spec$name, ":", e$message, "\n")
+      NULL
+    }
+  )
+
+  if (!is.null(out)) {
+    all_results_groom_eigen[[spec$name]] <- out$summary
+    all_pooled_groom_eigen[[spec$name]]  <- out$pooled_posterior
+
+    tryCatch({
+      saveRDS(all_results_groom_eigen,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_bayesian_groom_PARTIAL.rds")
+      saveRDS(all_pooled_groom_eigen,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_pooled_posteriors_bayesian_groom_PARTIAL.rds")
+      cat("  Saved progress after mom_groom_eigen ->", spec$name, "\n")
+    }, error = function(e) {
+      cat("  WARNING: save failed after mom_groom_eigen ->", spec$name, "-", e$message, "\n")
+    })
+  }
+}
+```
+
+# 9. TEST FIRST: mother proximity eigen, one mediator, small number of draws
+
+```{r test-small-run-prox-eigen, eval=FALSE}
+test_spec <- mediator_specs[[5]]  # groom_out_degree - matches the validated test used in scripts 5v5/7v6
+
+t0 <- Sys.time()
+test_out_prox_eigen <- run_mother_eigen_mediation_bayesian_joint(
+  sem_data_mom_prox_eigen, mother_prox_eigen_posteriors, "mom_prox_eigen", "Mother proximity eigen-centrality",
+  test_spec, num_draws = 5, chains = 2, iter = 2000, warmup = 1000
+)
+total_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+cat("\n=== TIMING TEST (mother proximity eigen) ===\n")
+cat("Total time for 5 draws:", round(total_time, 1), "seconds\n")
+cat("Draw 1 convergence: max Rhat =", round(test_out_prox_eigen$draw1_convergence$max_rhat, 4),
+    ", min ESS =", round(test_out_prox_eigen$draw1_convergence$min_ess, 1), "\n")
+
+print(as.data.frame(test_out_prox_eigen$summary), row.names = FALSE)
+```
+
+# 10. FULL RUN — mother proximity eigen-centrality (only after confirming timing + convergence above)
+
+```{r run-full-bayesian-prox-eigen, eval=T}
+all_results_prox_eigen <- list()
+all_pooled_prox_eigen   <- list()
+
+for (spec in mediator_specs) {
+
+  cat("\n>>> Starting mom_prox_eigen ->", spec$name, "at", format(Sys.time()), "\n")
+
+  out <- tryCatch(
+    run_mother_eigen_mediation_bayesian_joint(
+      sem_data_mom_prox_eigen, mother_prox_eigen_posteriors, "mom_prox_eigen", "Mother proximity eigen-centrality",
+      spec, num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+    ),
+    error = function(e) {
+      cat("  ERROR for mom_prox_eigen ->", spec$name, ":", e$message, "\n")
+      NULL
+    }
+  )
+
+  if (!is.null(out)) {
+    all_results_prox_eigen[[spec$name]] <- out$summary
+    all_pooled_prox_eigen[[spec$name]]  <- out$pooled_posterior
+
+    tryCatch({
+      saveRDS(all_results_prox_eigen,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_bayesian_prox_PARTIAL.rds")
+      saveRDS(all_pooled_prox_eigen,
+              "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_pooled_posteriors_bayesian_prox_PARTIAL.rds")
+      cat("  Saved progress after mom_prox_eigen ->", spec$name, "\n")
+    }, error = function(e) {
+      cat("  WARNING: save failed after mom_prox_eigen ->", spec$name, "-", e$message, "\n")
+    })
+  }
+}
+```
+
+# 11. Combine both predictor pipelines into the final combined output
+
+```{r combine-and-save-final, eval=T}
+all_results_eigen <- c(
+  setNames(all_results_groom_eigen, paste("Mother grooming eigen-centrality", names(all_results_groom_eigen), sep = " -> ")),
+  setNames(all_results_prox_eigen,  paste("Mother proximity eigen-centrality", names(all_results_prox_eigen),  sep = " -> "))
+)
+all_pooled_eigen <- c(
+  setNames(all_pooled_groom_eigen, paste("Mother grooming eigen-centrality", names(all_pooled_groom_eigen), sep = " -> ")),
+  setNames(all_pooled_prox_eigen,  paste("Mother proximity eigen-centrality", names(all_pooled_prox_eigen),  sep = " -> "))
+)
+
+full_summary_eigen <- bind_rows(all_results_eigen)
+
+tryCatch({
+  write.csv(full_summary_eigen,
+            "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_results_bayesian.csv",
+            row.names = FALSE)
+  saveRDS(all_pooled_eigen,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_pooled_posteriors_bayesian.rds")
+  cat("Done. Final combined results saved.\n")
+}, error = function(e) {
+  cat("WARNING: final save failed -", e$message, "\n")
+})
+
+print(as.data.frame(full_summary_eigen), row.names = FALSE)
+```
+
+```{r}
+emigrants_full <- emigrants_full %>%
+  left_join(mother_groom_eigen$summaries, by = c("Momcode", "BirthGp", "DOB")) %>%
+  left_join(mother_prox_eigen$summaries,  by = c("Momcode", "BirthGp", "DOB"))
+cat("=== Correlation: mother's own rank vs. her own network centrality ===\n\n")
+
+cat("mother_avg_elo vs mom_groom_eigen_mean:\n")
+print(cor.test(emigrants_full$mother_avg_elo, emigrants_full$mom_groom_eigen_mean, use = "complete.obs"))
+
+cat("\nmother_avg_elo vs mom_prox_eigen_mean:\n")
+print(cor.test(emigrants_full$mother_avg_elo, emigrants_full$mom_prox_eigen_mean, use = "complete.obs"))
+```
+
+```{r}
+mediator_specs_patch <- list(
+  list(name = "prox_degree", posteriors = prox_posteriors, field = "prox_degree")
+)
+
+all_results_patch7 <- list()
+all_pooled_patch7  <- list()
+
+out7_groom <- tryCatch(
+  run_mother_eigen_mediation_bayesian_joint(
+    sem_data_mom_groom_eigen, mother_groom_eigen_posteriors, "mom_groom_eigen",
+    "Mother grooming eigen-centrality", mediator_specs_patch[[1]],
+    num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+  ), error = function(e) { cat("  ERROR (groom eigen):", e$message, "\n"); NULL }
+)
+if (!is.null(out7_groom)) {
+  key <- "Mother grooming eigen-centrality -> prox_degree"
+  all_results_patch7[[key]] <- out7_groom$summary
+  all_pooled_patch7[[key]]  <- out7_groom$pooled_posterior
+}
+
+out7_prox <- tryCatch(
+  run_mother_eigen_mediation_bayesian_joint(
+    sem_data_mom_prox_eigen, mother_prox_eigen_posteriors, "mom_prox_eigen",
+    "Mother proximity eigen-centrality", mediator_specs_patch[[1]],
+    num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+  ), error = function(e) { cat("  ERROR (prox eigen):", e$message, "\n"); NULL }
+)
+if (!is.null(out7_prox)) {
+  key <- "Mother proximity eigen-centrality -> prox_degree"
+  all_results_patch7[[key]] <- out7_prox$summary
+  all_pooled_patch7[[key]]  <- out7_prox$pooled_posterior
+}
+
+existing_summary7 <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_results_bayesian.csv")
+existing_pooled7  <- readRDS("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_pooled_posteriors_bayesian.rds")
+
+file.copy("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_results_bayesian.csv",
+          paste0("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_results_bayesian_backup_",
+                 format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"), overwrite = FALSE)
+
+updated_summary7 <- bind_rows(existing_summary7 %>% filter(mediator != "prox_degree"),
+                              bind_rows(all_results_patch7))
+stale_keys7 <- grep("-> prox_degree$", names(existing_pooled7), value = TRUE)
+updated_pooled7 <- c(existing_pooled7[setdiff(names(existing_pooled7), stale_keys7)], all_pooled_patch7)
+
+write.csv(updated_summary7,
+          "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_results_bayesian.csv",
+          row.names = FALSE)
+saveRDS(updated_pooled7,
+        "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/sem_mother_eigen_network_pooled_posteriors_bayesian.rds")
+cat("Script 7: prox_degree patched for both predictors.\n")
+
+
+```
+

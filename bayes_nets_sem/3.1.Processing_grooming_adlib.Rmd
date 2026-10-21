@@ -1,0 +1,300 @@
+---
+title: "3.0. Process_grooming_adlib_data"
+author: "Alba Motes Rodrigo"
+date: "2026-03-20"
+output: html_document
+---
+```{r}
+library(dplyr)
+library(tidyr)
+library(igraph)
+library(purrr)
+```
+
+```{r}
+affiliative<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/adlib/affiliative.csv")
+emigrants <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/All_potential_immigrants_Josie_version.csv")
+```
+
+#Add rows for additional individuals in affiliative_data
+individual 3 and 4, behaviour 3 and 4 and interaction 2 need to be added as additional rows keeping the same date, time, group, context, data (same for indiv 5 and 6)
+```{r}
+reshape_affiliative_data <- function(data) {
+# Create the base dataset with primary interactions (individuals 1 & 2)
+  base_data <- data %>%
+    select(-idindividual3, -behaviourindiv3, -idindividual4, -behaviourindiv4, -interaction2,
+           -idindividual5, -behaviourindiv5, -idindividual6, -behaviourindiv6, -interaction3)
+  
+  # Create additional rows for individuals 3 & 4 (interaction2)
+  additional_data_34 <- data %>%
+    filter(!is.na(idindividual3) & idindividual3 != "" & 
+           !is.na(idindividual4) & idindividual4 != "") %>%
+    mutate(
+      idindividual1 = idindividual3,
+      behaviourindiv1 = behaviourindiv3,
+      idindividual2 = idindividual4,
+      behaviourindiv2 = behaviourindiv4,
+      interaction = interaction2
+    ) %>%
+    select(-idindividual3, -behaviourindiv3, -idindividual4, -behaviourindiv4, -interaction2,
+           -idindividual5, -behaviourindiv5, -idindividual6, -behaviourindiv6, -interaction3)
+  
+  # Create additional rows for individuals 5 & 6 (interaction3)
+  additional_data_56 <- data %>%
+    filter(!is.na(idindividual5) & idindividual5 != "" & 
+           !is.na(idindividual6) & idindividual6 != "") %>%
+    mutate(
+      idindividual1 = idindividual5,
+      behaviourindiv1 = behaviourindiv5,
+      idindividual2 = idindividual6,
+      behaviourindiv2 = behaviourindiv6,
+      interaction = interaction3
+    ) %>%
+    select(-idindividual3, -behaviourindiv3, -idindividual4, -behaviourindiv4, -interaction2,
+           -idindividual5, -behaviourindiv5, -idindividual6, -behaviourindiv6, -interaction3)
+  
+  # Combine all data
+  reshaped_data <- bind_rows(base_data, additional_data_34, additional_data_56) %>%
+    filter(!is.na(idindividual1) & idindividual1 != "" &
+           !is.na(idindividual2) & idindividual2 != "") %>%
+    arrange(date, time)
+  
+  # Print summary
+  cat("Original data:", nrow(data), "rows\n")
+  cat("Reshaped data:", nrow(reshaped_data), "rows\n")
+  cat("Additional rows created:", nrow(reshaped_data) - nrow(data), "\n")
+  cat("Rows from individual3/4:", nrow(additional_data_34), "\n")
+  cat("Rows from individual5/6:", nrow(additional_data_56), "\n")
+  
+  return(reshaped_data)
+}
+
+affiliative <- reshape_affiliative_data(affiliative)
+```
+
+#Filter to retain only grooming interactions
+```{r}
+# Keep only interactions that involve grooming (gr or bgr)
+valid_codes <- c("gr", "bgr")  # Changed to plural and vector
+
+contains_valid <- function(combined_code) {
+  # Handle NA values
+  if (is.na(combined_code)) return(FALSE)
+  # Convert to lowercase for case-insensitive matching
+  combined_code <- tolower(as.character(combined_code))
+  
+  # Remove whitespace from before and after for single codes
+  combined_code <- trimws(combined_code)
+  
+  # Check if it's a single code that matches any valid code
+  if (combined_code %in% valid_codes) return(TRUE)
+  
+  # Split the combined code into parts based on both spaces and dots
+  parts <- unlist(strsplit(combined_code, "[\\s\\.]+"))
+  
+  # Remove empty strings that might result from splitting
+  parts <- parts[parts != ""]
+  
+  # Check if any part matches any valid code
+  return(any(parts %in% valid_codes))
+}
+
+# Filter rows where at least one of the columns contains a valid code
+grooming_data <- affiliative[sapply(1:nrow(affiliative), function(i) {
+  contains_valid(affiliative$behaviourindiv1[i]) || 
+  contains_valid(affiliative$behaviourindiv2[i])
+}), ]
+
+# Check that only grooming instances are retained
+get_unique_codes <- function(data, col_names) {
+  # Combine all values from specified columns
+  all_values <- unlist(lapply(col_names, function(col) data[[col]]))
+  # Split by period and get all parts
+  all_parts <- unlist(strsplit(as.character(all_values), "\\."))
+  sort(unique(all_parts))
+}
+
+# Get unique codes from both columns
+unique_codes <- get_unique_codes(grooming_data, c("behaviourindiv1", "behaviourindiv2"))
+unique_codes
+unique(grooming_data$group)
+#change group names
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK", "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing"="CR", "IFamily"="IF")
+# Create a new column with abbreviate group names
+affiliative <- affiliative %>%mutate(
+    group_Abbreviation = group_abbreviations[group])  # Abbreviate group names
+grooming_data<-grooming_data%>%mutate(
+    group_Abbreviation = group_abbreviations[group])
+#remove rows without group
+affiliative<-affiliative[affiliative$group!="",]
+affiliative$date <- as.Date(affiliative$date)
+grooming_data<-grooming_data[grooming_data$group!="",]
+```
+
+#Modify affiliative data so that individual1 is always the groomer
+What it does:
+Rule 1 (Both have gr): Creates two directional interactions
+Original: individual1 (gr) ↔ individual2 (gr)
+Becomes: individual1 (gr) → individual2 + individual2 (gr) → individual1
+
+Rule 2 (individual2 has gr, individual1 doesn't): Flips everything
+Original: individual1 (bgr/other) ← individual2 (gr)
+Becomes: individual2 (gr) → individual1 (bgr/other)
+
+Rule 3 (individual1 has bgr, individual2 has gr): Swaps positions
+Original: individual1 (bgr) ← individual2 (gr)
+Becomes: individual2 (gr) → individual1 (bgr)
+
+```{r}
+modify_grooming_data <- function(data) {
+# Vectorized helper function to check if behaviors contain specific codes
+  contains_gr <- grepl("\\bgr\\b", tolower(data$behaviourindiv1)) | data$behaviourindiv1 == "gr"
+  contains_gr2 <- grepl("\\bgr\\b", tolower(data$behaviourindiv2)) | data$behaviourindiv2 == "gr"
+  contains_bgr <- grepl("\\bbgr\\b", tolower(data$behaviourindiv1)) | data$behaviourindiv1 == "bgr"
+  contains_bgr2 <- grepl("\\bbgr\\b", tolower(data$behaviourindiv2)) | data$behaviourindiv2 == "bgr"
+  
+  # Handle NA/empty values
+  contains_gr[is.na(data$behaviourindiv1) | data$behaviourindiv1 == ""] <- FALSE
+  contains_gr2[is.na(data$behaviourindiv2) | data$behaviourindiv2 == ""] <- FALSE
+  contains_bgr[is.na(data$behaviourindiv1) | data$behaviourindiv1 == ""] <- FALSE
+  contains_bgr2[is.na(data$behaviourindiv2) | data$behaviourindiv2 == ""] <- FALSE
+  
+  # Identify which rule applies to each row
+  rule1_rows <- contains_gr & contains_gr2  # Both have gr
+  rule3_rows <- contains_bgr & contains_gr2  # individual1 has bgr, individual2 has gr
+  rule2_rows <- contains_gr2 & !contains_gr & !rule3_rows  # Only individual2 has gr (and not already claimed by rule 3)
+  default_rows <- !(rule1_rows | rule2_rows | rule3_rows)  # Keep as is
+  
+  # Create list to store results
+  result_list <- list()
+  
+  # Process Rule 1: Both have gr - create two interactions
+  if(sum(rule1_rows) > 0) {
+    rule1_data <- data[rule1_rows, ]
+    
+    # First interaction: keep individual1 as groomer, empty individual2 behavior
+    interaction1 <- rule1_data
+    interaction1$behaviourindiv2 <- ""
+    
+    # Second interaction: flip so individual2 becomes groomer
+    interaction2 <- rule1_data
+    interaction2$idindividual1 <- rule1_data$idindividual2
+    interaction2$idindividual2 <- rule1_data$idindividual1
+    interaction2$behaviourindiv1 <- "gr"
+    interaction2$behaviourindiv2 <- ""
+    
+    result_list[[1]] <- interaction1
+    result_list[[2]] <- interaction2
+  }
+  
+  # Process Rule 2: Flip when only individual2 has gr
+  if(sum(rule2_rows) > 0) {
+    rule2_data <- data[rule2_rows, ]
+    flipped_data <- rule2_data
+    flipped_data$idindividual1 <- rule2_data$idindividual2
+    flipped_data$idindividual2 <- rule2_data$idindividual1
+    flipped_data$behaviourindiv1 <- rule2_data$behaviourindiv2
+    flipped_data$behaviourindiv2 <- rule2_data$behaviourindiv1
+    
+    result_list[[length(result_list) + 1]] <- flipped_data
+  }
+  
+  # Process Rule 3: Flip when individual1 has bgr and individual2 has gr
+  if(sum(rule3_rows) > 0) {
+    rule3_data <- data[rule3_rows, ]
+    flipped_data <- rule3_data
+    flipped_data$idindividual1 <- rule3_data$idindividual2
+    flipped_data$idindividual2 <- rule3_data$idindividual1
+    flipped_data$behaviourindiv1 <- rule3_data$behaviourindiv2
+    flipped_data$behaviourindiv2 <- rule3_data$behaviourindiv1
+    
+    result_list[[length(result_list) + 1]] <- flipped_data
+  }
+  
+  # Process Default: Keep as is
+  if(sum(default_rows) > 0) {
+    result_list[[length(result_list) + 1]] <- data[default_rows, ]
+  }
+  
+  # Combine all results at once (much faster than repeated rbind)
+  result_data <- do.call(rbind, result_list)
+  
+  # Sort by date and time
+  result_data <- result_data[order(result_data$date, result_data$time), ]
+  
+  # Reset row names
+  rownames(result_data) <- NULL
+  
+  # Print summary
+  cat("Original data:", nrow(data), "rows\n")
+  cat("Modified data:", nrow(result_data), "rows\n")
+  cat("Additional rows created:", nrow(result_data) - nrow(data), "\n")
+  cat("Rule 1 (reciprocal gr):", sum(rule1_rows), "rows ->", sum(rule1_rows) * 2, "rows\n")
+  cat("Rule 2 (flip for gr):", sum(rule2_rows), "rows flipped\n")
+  cat("Rule 3 (bgr/gr swap):", sum(rule3_rows), "rows flipped\n")
+  cat("Unchanged rows:", sum(default_rows), "\n")
+  
+  n_dups <- sum(duplicated(result_data))
+  cat("Exact duplicate rows in output:", n_dups, "\n")
+  if (n_dups > 0) {
+    warning(n_dups, " duplicate rows detected in modify_grooming_data() output - ",
+            "check whether rule masks (rule1_rows/rule2_rows/rule3_rows) overlap. ",
+            "Keeping one copy of each.")
+    result_data <- result_data[!duplicated(result_data), ]
+  }
+  
+  
+  return(result_data)
+}
+grooming_data <- modify_grooming_data(grooming_data)
+```
+Original data: 159853 rows
+Modified data: 184847 rows
+Additional rows created: 24994 
+Rule 1 (reciprocal gr): 23686 rows -> 47372 rows
+Rule 2 (flip for gr): 20688 rows flipped
+Rule 3 (bgr/gr swap): 1308 rows flipped
+Unchanged rows: 115479 
+
+```{r}
+# count table of gr/bgr combinations
+get_combination_counts <- function(data) {
+ 
+ # Classify behaviors
+ classify <- function(behavior) {
+   if(is.na(behavior) || behavior == "") return("empty")
+   behavior <- tolower(as.character(behavior))
+   if(grepl("\\bgr\\b", behavior) || behavior == "gr") return("gr")
+   if(grepl("\\bbgr\\b", behavior) || behavior == "bgr") return("bgr")
+   return("other")
+ }
+ 
+ behav1 <- sapply(data$behaviourindiv1, classify)
+ behav2 <- sapply(data$behaviourindiv2, classify)
+ 
+ return(table(behav1, behav2))
+}
+
+# Get the counts
+combination_counts <- get_combination_counts(grooming_data)
+print(combination_counts)
+
+#remove combinations where neither behaviour column has gr
+grooming_data <- grooming_data[
+ grepl("\\bgr\\b", tolower(grooming_data$behaviourindiv1)) | 
+ grooming_data$behaviourindiv1 == "gr" |
+ grepl("\\bgr\\b", tolower(grooming_data$behaviourindiv2)) | 
+ grooming_data$behaviourindiv2 == "gr", 
+]
+
+#Check it worked
+combination_counts <- get_combination_counts(grooming_data)
+print(combination_counts)
+```
+  behav2
+behav1    bgr  empty     gr  other
+    gr  31784 122533     88  30296
+```{r}
+write.csv(grooming_data, "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/grooming_data2010_2025.csv")
+```
+

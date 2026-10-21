@@ -1,0 +1,789 @@
+---
+title: "10. Maternal predictors -> juvenile (pre-dispersal) social behaviour -> male rank post-dispersal"
+author: "Alba Motes Rodrigo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+Tests whether the son's OWN social network position during his juvenile
+period (natal group, pre-dispersal) mediates the relationship between
+maternal predictors and his rank one year after dispersal — as opposed
+to scripts 5-8, which test post-dispersal network position as the
+mediator.
+
+Model structure is identical to script 5's validated joint model
+(`bf(mediator_z ~ predictor_z, sigma ~ obs_weight) + bf(outcome_z ~
+mediator_z + predictor_z, sigma ~ obs_weight) + set_rescor(FALSE)`,
+compiled once and reused via `update(..., recompile = FALSE)`), with
+one addition: `obs_weight` here reflects observation completeness
+during the JUVENILE window, not the post-dispersal window, since that's
+the period the mediator was measured in.
+
+```{r setup}
+library(dplyr)
+library(tibble)
+library(purrr)
+library(brms)
+library(posterior)
+
+data_dir <- "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data"
+```
+
+# Load data
+
+```{r load-data}
+emigrants_full <- read.csv(file.path(data_dir, "emigrants_full_merged.csv"))
+
+prox_posteriors_juv  <- readRDS(file.path(data_dir, "prox_posteriors_juvenile.rds"))
+groom_posteriors_juv <- readRDS(file.path(data_dir, "groom_posteriors_juvenile.rds"))
+
+prox_juv_summary  <- read.csv(file.path(data_dir, "network_mets_prox_bayes_juvenile.csv"))
+groom_juv_summary <- read.csv(file.path(data_dir, "network_mets_groom_bayes_juvenile.csv"))
+
+# ── maternal-network predictors (computed in script 7, never previously
+#    loaded here — this is why they've been missing from this analysis) ──
+mother_groom_eigen_posteriors <- readRDS(file.path(data_dir, "mother_groom_eigen_posteriors.rds"))
+mother_prox_eigen_posteriors  <- readRDS(file.path(data_dir, "mother_prox_eigen_posteriors.rds"))
+
+group_presence_matrices <- readRDS(file.path(data_dir, "group_presence_matrices.rds"))
+
+# ── needed for recalculating maternal investment variables on the
+#    corrected (DOB+365 -> dispersal) juvenile window ───────────────────
+grooming_data <- read.csv(file.path(data_dir, "grooming_data2010_2025.csv"))
+scans         <- read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scans_for_bison.csv")
+
+grooming_data$date <- as.Date(grooming_data$date)
+grooming_data$idindividual1 <- tolower(as.character(grooming_data$idindividual1))
+grooming_data$idindividual2 <- tolower(as.character(grooming_data$idindividual2))
+
+scans$date <- as.Date(scans$date)
+
+group_abbreviations <- c("Baie Dankie" = "BD", "Noha" = "NH", "Ankhase" = "AK",
+                         "Kubu" = "KB", "Lemon Tree" = "LT", "Crossing" = "CR",
+                         "IFamily" = "IF")
+
+if (!"group_Abbreviation" %in% names(grooming_data)) {
+  grooming_data$group_Abbreviation <- group_abbreviations[grooming_data$group]
+}
+if (!"group_Abbreviation" %in% names(scans)) {
+  scans$group_Abbreviation <- group_abbreviations[scans$group]
+}
+```
+
+# Rebuild the juvenile window (needed for juvenile_obs_weight)
+
+```{r}
+## 0. Build the juvenile window (same definition as scripts 9-11)
+
+emigrants_full <- emigrants_full %>%
+  mutate(
+    DOB              = as.Date(DOB),
+    DateImmigration1 = as.Date(DateImmigration1),
+    DepartureNatalGp = as.Date(DepartureNatalGp),
+    dispersal_date   = if_else(!is.na(DateImmigration1), DateImmigration1, DepartureNatalGp),
+    juvenile_window_start = DOB + 365,
+    juvenile_window_end   = dispersal_date
+  ) %>%
+  mutate(
+    juvenile_window_start = if_else(juvenile_window_start < juvenile_window_end,
+                                     juvenile_window_start, as.Date(NA)),
+    juvenile_window_end   = if_else(!is.na(juvenile_window_start), juvenile_window_end, as.Date(NA))
+  )
+
+## 1a. Maternal grooming investment
+
+emigrants_full$mom_groom_days_to_son <- NA
+emigrants_full$mom_total_groom_days <- NA
+emigrants_full$mom_groom_proportion <- NA
+
+for (i in seq_len(nrow(emigrants_full))) {
+  mom <- emigrants_full$Momcode[i]; son <- emigrants_full$Code[i]
+  grp <- emigrants_full$BirthGp[i]
+  window_start <- emigrants_full$juvenile_window_start[i]
+  window_end   <- emigrants_full$juvenile_window_end[i]
+
+  if (any(is.na(c(mom, son, grp))) || is.na(window_start) || is.na(window_end) ||
+      mom == "" || son == "") next
+
+  mom_groom <- grooming_data %>%
+    filter(idindividual1 == mom, group_Abbreviation == grp,
+           date >= window_start, date <= window_end)
+
+  if (nrow(mom_groom) == 0) next
+
+  total_days <- n_distinct(mom_groom$date)
+  days_to_son <- mom_groom %>% filter(idindividual2 == son) %>% summarise(n = n_distinct(date)) %>% pull(n)
+
+  emigrants_full$mom_groom_days_to_son[i] <- days_to_son
+  emigrants_full$mom_total_groom_days[i]  <- total_days
+  emigrants_full$mom_groom_proportion[i]  <- days_to_son / total_days
+}
+
+cat("mom_groom_proportion coverage (new window):\n")
+sum(!is.na(emigrants_full$mom_groom_proportion))
+
+## 1b. Maternal proximity investment
+
+close_categories <- c("Holding/Clinging", "Contact", "Arm's Length", "Around (<5m)", "<5m")
+emigrants_full$mom_prox_with_son <- NA
+emigrants_full$mom_son_total_scans <- NA
+emigrants_full$mom_prox_proportion <- NA
+
+for (i in seq_len(nrow(emigrants_full))) {
+  mom <- emigrants_full$Momcode[i]; son <- emigrants_full$Code[i]
+  grp <- emigrants_full$BirthGp[i]
+  window_start <- emigrants_full$juvenile_window_start[i]
+  window_end   <- emigrants_full$juvenile_window_end[i]
+
+  if (any(is.na(c(mom, son, grp))) || is.na(window_start) || is.na(window_end) ||
+      mom == "" || son == "") next
+
+  mom_scans <- scans %>%
+    mutate(date = as.Date(date)) %>%
+    filter(tolower(idindividual1) == mom, group_Abbreviation == grp,
+           date >= window_start, date <= window_end)
+
+  if (nrow(mom_scans) == 0) next
+
+  n_total <- nrow(mom_scans)
+  n_close <- sum(mom_scans$infant %in% close_categories, na.rm = TRUE)
+
+  emigrants_full$mom_prox_with_son[i]   <- n_close
+  emigrants_full$mom_son_total_scans[i] <- n_total
+  emigrants_full$mom_prox_proportion[i] <- n_close / n_total
+}
+
+cat("mom_prox_proportion coverage (new window):\n")
+sum(!is.na(emigrants_full$mom_prox_proportion))#78
+```
+
+# Compute juvenile_obs_weight
+
+Raw count of days present during the juvenile window (NOT a proportion
+of window length, unlike the post-dispersal `obs_weight` in script 5).
+A raw count is more appropriate here than a ratio: because the juvenile
+window varies from ~1 year to several years across males, a male
+observed on 200 days out of a 4-year window has substantially more data
+underlying his network/rank estimate than the same 200-day count would
+imply for a male with a 1-year window — the raw count better reflects
+actual observation density feeding the `sigma ~ obs_weight` term than a
+ratio would.
+
+```{r compute-juvenile-obs-weight}
+compute_juvenile_days_present <- function(natal_group, window_start, window_end,
+                                          Code, group_presence_matrices) {
+  if (any(is.na(c(natal_group, window_start, window_end, Code))) ||
+      !natal_group %in% names(group_presence_matrices)) {
+    return(NA_real_)
+  }
+  pm <- group_presence_matrices[[natal_group]] %>%
+    filter(Date >= as.Date(window_start), Date <= as.Date(window_end))
+  if (nrow(pm) == 0 || !Code %in% names(pm)) return(NA_real_)
+  sum(pm[[Code]] == 1, na.rm = TRUE)
+}
+
+emigrants_full <- emigrants_full %>%
+  rowwise() %>%
+  mutate(
+    juvenile_obs_weight = compute_juvenile_days_present(
+      natal_group = BirthGp,
+      window_start = juvenile_window_start,
+      window_end = juvenile_window_end,
+      Code = Code,
+      group_presence_matrices = group_presence_matrices
+    )
+  ) %>%
+  ungroup()
+
+cat("juvenile_obs_weight (raw days present) summary:\n")
+summary(emigrants_full$juvenile_obs_weight)
+emigrants_full$juvenile_obs_weight
+```
+
+# Merge juvenile network summaries into emigrants_full
+
+```{r merge-juvenile-summaries}
+emigrants_full <- emigrants_full %>%
+  left_join(
+    prox_juv_summary %>%
+      select(Code, prox_strength_juv_mean = strength_mean, prox_degree_juv_mean = degree_mean),
+    by = "Code"
+  ) %>%
+  left_join(
+    groom_juv_summary %>%
+      select(Code,
+             groom_out_strength_juv_mean = out_strength_mean,
+             groom_in_strength_juv_mean  = in_strength_mean,
+             groom_out_degree_juv_mean   = out_degree_mean,
+             groom_in_degree_juv_mean    = in_degree_mean),
+    by = "Code"
+  )
+
+cat("Coverage of juvenile network summaries after merge:\n")
+emigrants_full %>%
+  summarise(
+    n_total                  = n(),
+    n_prox_strength_juv      = sum(!is.na(prox_strength_juv_mean)),
+    n_prox_degree_juv        = sum(!is.na(prox_degree_juv_mean)),
+    n_groom_out_strength_juv = sum(!is.na(groom_out_strength_juv_mean)),
+    n_groom_in_strength_juv  = sum(!is.na(groom_in_strength_juv_mean)),
+    n_groom_out_degree_juv   = sum(!is.na(groom_out_degree_juv_mean)),
+    n_groom_in_degree_juv    = sum(!is.na(groom_in_degree_juv_mean))
+  ) %>% print()
+```
+# A tibble: 1 × 7
+  n_total n_prox_strength_juv n_prox_degree_juv n_groom_out_strength_…¹ n_groom_in_strength_…² n_groom_out_degree_juv
+    <int>               <int>             <int>                   <int>                  <int>                  <int>
+1     212                  81                81                      77                     77                     77
+# Sample size funnel (check feasibility before the full run)
+
+```{r sample-size-funnel}
+emigrants_full %>%
+  summarise(
+    n_total                = n(),
+    n_has_maternal_elo     = sum(!is.na(mother_avg_elo)),
+    n_has_outcome          = sum(!is.na(elo_one_year_male_male)),
+    n_has_juvenile_obs_wt  = sum(!is.na(juvenile_obs_weight)),
+    n_has_prox_juv_post    = sum(Code %in% names(prox_posteriors_juv)),
+    n_has_groom_juv_post   = sum(Code %in% names(groom_posteriors_juv)),
+    n_full_prox_pipeline   = sum(!is.na(mother_avg_elo) & !is.na(elo_one_year_male_male) &
+                                  !is.na(juvenile_obs_weight) & Code %in% names(prox_posteriors_juv)),
+    n_full_groom_pipeline  = sum(!is.na(mother_avg_elo) & !is.na(elo_one_year_male_male) &
+                                  !is.na(juvenile_obs_weight) & Code %in% names(groom_posteriors_juv))
+  ) %>% print()
+```
+  n_total n_has_maternal_elo n_has_outcome n_has_juvenile_obs_wt n_has_prox_juv_post n_has_groom_juv_post
+    <int>              <int>         <int>                 <int>               <int>                <int>
+1     212                 70           129                    79                  81                   77
+# Mediator specifications
+
+```{r mediator-specs}
+mediator_specs <- list(
+  list(name = "prox_strength_juv",      posteriors = prox_posteriors_juv,  field = "prox_strength_juv"),
+  list(name = "prox_degree_juv",        posteriors = prox_posteriors_juv,  field = "prox_degree_juv"),
+  list(name = "groom_out_strength_juv", posteriors = groom_posteriors_juv, field = "groom_out_strength_juv"),
+  list(name = "groom_in_strength_juv",  posteriors = groom_posteriors_juv, field = "groom_in_strength_juv"),
+  list(name = "groom_out_degree_juv",   posteriors = groom_posteriors_juv, field = "groom_out_degree_juv"),
+  list(name = "groom_in_degree_juv",    posteriors = groom_posteriors_juv, field = "groom_in_degree_juv")
+)
+```
+
+# Summary + convergence helpers (identical to script 5)
+
+```{r helpers}
+summarize_network_draws <- function(estimates) {
+  tibble(
+    estimate_mean   = mean(estimates),
+    estimate_median = median(estimates),
+    network_q025    = quantile(estimates, 0.025, names = FALSE),
+    network_q975    = quantile(estimates, 0.975, names = FALSE),
+    prop_positive   = mean(estimates > 0),
+    prop_negative   = mean(estimates < 0)
+  )
+}
+
+check_joint_convergence <- function(fit, rhat_threshold = 1.01, ess_threshold = 400) {
+  summ <- summarise_draws(as_draws_df(fit))
+  bad_rhat <- summ %>% filter(rhat > rhat_threshold)
+  bad_ess  <- summ %>% filter(ess_bulk < ess_threshold | ess_tail < ess_threshold)
+  ok <- nrow(bad_rhat) == 0 && nrow(bad_ess) == 0
+  if (!ok) {
+    cat("    CONVERGENCE WARNING:\n")
+    if (nrow(bad_rhat) > 0) { cat("    Parameters with Rhat >", rhat_threshold, ":\n"); print(bad_rhat %>% select(variable, rhat)) }
+    if (nrow(bad_ess) > 0)  { cat("    Parameters with ESS <", ess_threshold, ":\n");  print(bad_ess %>% select(variable, ess_bulk, ess_tail)) }
+  }
+  list(ok = ok, max_rhat = max(summ$rhat, na.rm = TRUE),
+       min_ess = min(c(summ$ess_bulk, summ$ess_tail), na.rm = TRUE))
+}
+```
+
+# Joint Bayesian mediation function
+
+Same structure as `run_bison_mediation_bayesian_joint()` (script 5),
+generalised to accept which predictor column to use, and using
+`juvenile_obs_weight` in place of the post-dispersal `obs_weight`.
+
+```{r mediation-function}
+run_juvenile_mediation_bayesian_joint <- function(emigrants_full, predictor_col, predictor_label, spec,
+                                                    num_draws, chains = 2, iter = 2000, warmup = 1000,
+                                                    adapt_delta = 0.95) {
+
+  cat("Running JUVENILE-MEDIATOR joint mediation:", predictor_label, "->", spec$name, "\n")
+
+  sem_data <- emigrants_full %>%
+    filter(!is.na(.data[[predictor_col]]),
+           !is.na(elo_one_year_male_male),
+           !is.na(juvenile_obs_weight))
+
+  males_with_posteriors <- sem_data$Code[sem_data$Code %in% names(spec$posteriors)]
+  dat <- sem_data %>% filter(Code %in% males_with_posteriors)
+
+  if (nrow(dat) < 10) {
+    cat("  Too few males with posteriors:", nrow(dat), "- skipping\n")
+    return(NULL)
+  }
+  cat("  n =", nrow(dat), "\n")
+
+  first_post <- spec$posteriors[[males_with_posteriors[1]]][[spec$field]]
+  actual_draws <- length(first_post)
+  num_draws <- min(num_draws, actual_draws)
+
+  predictor_center <- mean(dat[[predictor_col]])
+  predictor_scale  <- sd(dat[[predictor_col]])
+  
+  obs_weight_center <- mean(dat$juvenile_obs_weight, na.rm = TRUE)
+  obs_weight_scale  <- sd(dat$juvenile_obs_weight, na.rm = TRUE)
+
+  mediator_point_estimates <- sapply(dat$Code, function(id) {
+    mean(spec$posteriors[[id]][[spec$field]][1:num_draws])
+  })
+  mediator_center <- mean(mediator_point_estimates)
+  mediator_scale   <- sd(mediator_point_estimates)
+
+  build_draw_data <- function(k) {
+    dat_k <- dat
+    dat_k$mediator    <- sapply(dat_k$Code, function(id) spec$posteriors[[id]][[spec$field]][k])
+    dat_k$predictor_z <- (dat_k[[predictor_col]] - predictor_center) / predictor_scale
+    dat_k$male_elo_z  <- scale(dat_k$elo_one_year_male_male)[, 1]
+    dat_k$mediator_z  <- (dat_k$mediator - mediator_center) / mediator_scale
+    dat_k$obs_weight  <- (dat_k$juvenile_obs_weight - obs_weight_center) / obs_weight_scale
+    dat_k
+  }
+
+  dat_1 <- build_draw_data(1)
+
+  bf_mediator <- bf(mediator_z ~ predictor_z, sigma ~ obs_weight)
+  bf_outcome  <- bf(male_elo_z ~ mediator_z + predictor_z, sigma ~ obs_weight)
+
+  cat("  Compiling joint Stan model (draw 1)...\n")
+  t0 <- Sys.time()
+
+  fit_base <- brm(
+    bf_mediator + bf_outcome + set_rescor(FALSE),
+    data = dat_1, family = gaussian(),
+    chains = chains, iter = iter, warmup = warmup,
+    seed = 1, refresh = 0, silent = 2,
+    control = list(adapt_delta = adapt_delta)
+  )
+
+  compile_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  cat("  Compilation + first fit took", round(compile_time, 1), "seconds\n")
+
+  conv1 <- check_joint_convergence(fit_base)
+  if (!conv1$ok) {
+    cat("  WARNING: draw 1 did not converge cleanly (max Rhat =",
+        round(conv1$max_rhat, 4), ", min ESS =", round(conv1$min_ess, 1), ") - inspect before proceeding\n")
+  }
+
+  a_all <- numeric(0); b_all <- numeric(0); c_all <- numeric(0); ind_all <- numeric(0)
+
+  for (k in 1:num_draws) {
+
+    dat_k <- if (k == 1) dat_1 else build_draw_data(k)
+    fit_k <- if (k == 1) fit_base else update(fit_base, newdata = dat_k, recompile = FALSE, refresh = 0, silent = 2)
+
+    post_k <- as_draws_df(fit_k)
+
+    a_post   <- post_k$b_mediatorz_predictor_z
+    b_post   <- post_k$b_maleeloz_mediator_z
+    c_post   <- post_k$b_maleeloz_predictor_z
+    ind_post <- a_post * b_post
+
+    a_all   <- c(a_all, a_post)
+    b_all   <- c(b_all, b_post)
+    c_all   <- c(c_all, c_post)
+    ind_all <- c(ind_all, ind_post)
+  }
+
+  tot_all <- c_all + ind_all
+
+  results <- bind_rows(
+    summarize_network_draws(a_all)   %>% mutate(path = "a (predictor -> juvenile mediator)"),
+    summarize_network_draws(b_all)   %>% mutate(path = "b (juvenile mediator -> male elo)"),
+    summarize_network_draws(c_all)   %>% mutate(path = "c' (predictor -> male elo, direct)"),
+    summarize_network_draws(ind_all) %>% mutate(path = "indirect (a * b)"),
+    summarize_network_draws(tot_all) %>% mutate(path = "c (total effect)")
+  ) %>%
+    mutate(predictor = predictor_label, mediator = spec$name,
+           n = nrow(dat), num_draws = num_draws, .before = 1)
+
+  cat("\n  === Results:", predictor_label, "->", spec$name, "(n =", nrow(dat), ") ===\n")
+  for (j in 1:nrow(results)) {
+    cat(sprintf("  %-40s mean = %6.3f  95%% CI [%6.3f, %6.3f]  pd = %4.1f%%\n",
+                results$path[j], results$estimate_mean[j],
+                results$network_q025[j], results$network_q975[j],
+                max(results$prop_positive[j], results$prop_negative[j]) * 100))
+  }
+  cat("\n")
+
+  list(summary = results, pooled_posterior = tibble(a = a_all, b = b_all, c_prime = c_all, indirect = ind_all))
+}
+```
+
+# Joint Bayesian mediation function — maternal-network predictors
+
+Same joint model structure as `run_juvenile_mediation_bayesian_joint()`
+above, but for predictors that are themselves posterior draws (maternal
+grooming/proximity eigen-centrality from script 7) rather than a fixed
+observed column. Draws a fresh sample of the mother's network position
+on every iteration `k`, matched to her via the `mom_key` prefix system
+from script 7, so predictor-side uncertainty is propagated through the
+mediation exactly like the mediator- and outcome-side uncertainty
+already is.
+
+```{r mom-key-match}
+build_predictor_sem_data_juv <- function(emigrants_full, predictor_posteriors) {
+  emigrants_full %>%
+    mutate(mom_key_prefix = paste0(Momcode, "_")) %>%
+    rowwise() %>%
+    mutate(mom_key = {
+      matches <- names(predictor_posteriors)[startsWith(names(predictor_posteriors), mom_key_prefix)]
+      if (length(matches) == 0) NA_character_ else matches[1]
+    }) %>%
+    ungroup()
+}
+```
+
+```{r mediation-function-eigen}
+run_juvenile_mediation_bayesian_joint_eigen <- function(emigrants_full, predictor_posteriors,
+                                                          predictor_field, predictor_label, spec,
+                                                          num_draws, chains = 2, iter = 2000, warmup = 1000,
+                                                          adapt_delta = 0.95) {
+
+  cat("Running JUVENILE-MEDIATOR joint mediation (maternal-network predictor):",
+      predictor_label, "->", spec$name, "\n")
+
+  sem_data <- build_predictor_sem_data_juv(emigrants_full, predictor_posteriors) %>%
+    filter(!is.na(mom_key),
+           !is.na(elo_one_year_male_male),
+           !is.na(juvenile_obs_weight))
+
+  males_with_posteriors <- sem_data$Code[sem_data$Code %in% names(spec$posteriors)]
+  dat <- sem_data %>% filter(Code %in% males_with_posteriors)
+
+  if (nrow(dat) < 10) {
+    cat("  Too few males with posteriors:", nrow(dat), "- skipping\n")
+    return(NULL)
+  }
+  cat("  n =", nrow(dat), "\n")
+
+  first_mediator_post  <- spec$posteriors[[males_with_posteriors[1]]][[spec$field]]
+  first_predictor_post <- predictor_posteriors[[dat$mom_key[1]]][[predictor_field]]
+  actual_draws <- min(length(first_mediator_post), length(first_predictor_post))
+  num_draws <- min(num_draws, actual_draws)
+
+  predictor_point_estimates <- sapply(dat$mom_key, function(key) {
+    mean(predictor_posteriors[[key]][[predictor_field]][1:num_draws], na.rm = TRUE)
+  })
+  predictor_center <- mean(predictor_point_estimates)
+  predictor_scale  <- sd(predictor_point_estimates)
+
+  obs_weight_center <- mean(dat$juvenile_obs_weight, na.rm = TRUE)
+  obs_weight_scale  <- sd(dat$juvenile_obs_weight, na.rm = TRUE)
+
+  mediator_point_estimates <- sapply(dat$Code, function(id) {
+    mean(spec$posteriors[[id]][[spec$field]][1:num_draws])
+  })
+  mediator_center <- mean(mediator_point_estimates)
+  mediator_scale  <- sd(mediator_point_estimates)
+
+  build_draw_data <- function(k) {
+    dat_k <- dat
+    dat_k$mediator      <- sapply(dat_k$Code,    function(id)  spec$posteriors[[id]][[spec$field]][k])
+    dat_k$predictor_raw <- sapply(dat_k$mom_key, function(key) predictor_posteriors[[key]][[predictor_field]][k])
+    dat_k$predictor_z   <- (dat_k$predictor_raw - predictor_center) / predictor_scale
+    dat_k$male_elo_z    <- scale(dat_k$elo_one_year_male_male)[, 1]
+    dat_k$mediator_z    <- (dat_k$mediator - mediator_center) / mediator_scale
+    dat_k$obs_weight    <- (dat_k$juvenile_obs_weight - obs_weight_center) / obs_weight_scale
+    dat_k
+  }
+
+  dat_1 <- build_draw_data(1)
+
+  bf_mediator <- bf(mediator_z ~ predictor_z, sigma ~ obs_weight)
+  bf_outcome  <- bf(male_elo_z ~ mediator_z + predictor_z, sigma ~ obs_weight)
+
+  cat("  Compiling joint Stan model (draw 1)...\n")
+  t0 <- Sys.time()
+
+  fit_base <- brm(
+    bf_mediator + bf_outcome + set_rescor(FALSE),
+    data = dat_1, family = gaussian(),
+    chains = chains, iter = iter, warmup = warmup,
+    seed = 1, refresh = 0, silent = 2,
+    control = list(adapt_delta = adapt_delta)
+  )
+
+  compile_time <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  cat("  Compilation + first fit took", round(compile_time, 1), "seconds\n")
+
+  conv1 <- check_joint_convergence(fit_base)
+  if (!conv1$ok) {
+    cat("  WARNING: draw 1 did not converge cleanly (max Rhat =",
+        round(conv1$max_rhat, 4), ", min ESS =", round(conv1$min_ess, 1), ") - inspect before proceeding\n")
+  }
+
+  a_all <- numeric(0); b_all <- numeric(0); c_all <- numeric(0); ind_all <- numeric(0)
+
+  for (k in 1:num_draws) {
+
+    dat_k <- if (k == 1) dat_1 else build_draw_data(k)
+    fit_k <- if (k == 1) fit_base else update(fit_base, newdata = dat_k, recompile = FALSE, refresh = 0, silent = 2)
+
+    post_k <- as_draws_df(fit_k)
+
+    a_post   <- post_k$b_mediatorz_predictor_z
+    b_post   <- post_k$b_maleeloz_mediator_z
+    c_post   <- post_k$b_maleeloz_predictor_z
+    ind_post <- a_post * b_post
+
+    a_all   <- c(a_all, a_post)
+    b_all   <- c(b_all, b_post)
+    c_all   <- c(c_all, c_post)
+    ind_all <- c(ind_all, ind_post)
+  }
+
+  tot_all <- c_all + ind_all
+
+  results <- bind_rows(
+    summarize_network_draws(a_all)   %>% mutate(path = "a (predictor -> juvenile mediator)"),
+    summarize_network_draws(b_all)   %>% mutate(path = "b (juvenile mediator -> male elo)"),
+    summarize_network_draws(c_all)   %>% mutate(path = "c' (predictor -> male elo, direct)"),
+    summarize_network_draws(ind_all) %>% mutate(path = "indirect (a * b)"),
+    summarize_network_draws(tot_all) %>% mutate(path = "c (total effect)")
+  ) %>%
+    mutate(predictor = predictor_label, mediator = spec$name,
+           n = nrow(dat), num_draws = num_draws, .before = 1)
+
+  cat("\n  === Results:", predictor_label, "->", spec$name, "(n =", nrow(dat), ") ===\n")
+  for (j in 1:nrow(results)) {
+    cat(sprintf("  %-40s mean = %6.3f  95%% CI [%6.3f, %6.3f]  pd = %4.1f%%\n",
+                results$path[j], results$estimate_mean[j],
+                results$network_q025[j], results$network_q975[j],
+                max(results$prop_positive[j], results$prop_negative[j]) * 100))
+  }
+  cat("\n")
+
+  list(summary = results, pooled_posterior = tibble(a = a_all, b = b_all, c_prime = c_all, indirect = ind_all))
+}
+```
+
+# TEST FIRST: small number of draws
+
+```{r test-small-run, eval=FALSE}
+test_spec <- mediator_specs[[5]]  # groom_out_degree_juv
+
+test_out <- run_juvenile_mediation_bayesian_joint(
+  emigrants_full, "mother_avg_elo", "Maternal rank", test_spec,
+  num_draws = 5, chains = 2, iter = 2000, warmup = 1000
+)
+print(as.data.frame(test_out$summary), row.names = FALSE)
+```
+
+# FULL RUN — predictor: maternal rank
+
+```{r run-full-bayesian, eval=T}
+
+predictor_list <- list(
+  list(col = "mom_groom_proportion",        label = "Maternal grooming investment"),
+  list(col = "mom_prox_proportion",         label = "Maternal proximity investment"),
+  #list(col = "mother_presence_proportion",  label = "Maternal presence"),
+  #list(col = "n_earlier_offspring",         label = "Maternal parity"),
+  list(col = "mother_avg_elo",              label = "Maternal rank")
+)
+
+all_results_juv <- list()
+all_pooled_juv   <- list()
+
+for (pred in predictor_list) {
+
+  if (!pred$col %in% names(emigrants_full)) {
+    cat("\n>>> SKIPPING predictor '", pred$label, "' - column '", pred$col,
+        "' not found in emigrants_full\n", sep = "")
+    next
+  }
+
+  for (spec in mediator_specs) {
+
+    run_key <- paste(pred$label, spec$name, sep = " -> ")
+    cat("\n>>> Starting", run_key, "at", format(Sys.time()), "\n")
+
+    out <- tryCatch(
+      run_juvenile_mediation_bayesian_joint(
+        emigrants_full, pred$col, pred$label, spec,
+        num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+      ),
+      error = function(e) {
+        cat("  ERROR for", run_key, ":", e$message, "\n")
+        NULL
+      }
+    )
+
+    if (!is.null(out)) {
+      all_results_juv[[run_key]] <- out$summary
+      all_pooled_juv[[run_key]]  <- out$pooled_posterior
+
+      tryCatch({
+        saveRDS(all_results_juv,
+                file.path(data_dir, "juvenile_mediation_results_bayesian_ALL_PARTIAL.rds"))
+        saveRDS(all_pooled_juv,
+                file.path(data_dir, "juvenile_mediation_pooled_posteriors_ALL_PARTIAL.rds"))
+        cat("  Saved progress after", run_key, "\n")
+      }, error = function(e) cat("  WARNING: save failed after", run_key, "-", e$message, "\n"))
+    }
+  }
+}
+
+# ── Maternal-network predictors (posterior-propagated) ──────────────────
+# These were computed in script 7 (mother_groom_eigen_posteriors /
+# mother_prox_eigen_posteriors) but never loaded into this script until
+# now - see the "Load data" chunk above. Appending into the same
+# all_results_juv / all_pooled_juv lists as the loop above, so they end
+# up merged into full_summary_juv below.
+
+maternal_predictor_list <- list(
+  list(posteriors = mother_groom_eigen_posteriors, field = "mom_groom_eigen",
+       label = "Mother grooming eigen-centrality"),
+  list(posteriors = mother_prox_eigen_posteriors,  field = "mom_prox_eigen",
+       label = "Mother proximity eigen-centrality")
+)
+
+for (pred in maternal_predictor_list) {
+  for (spec in mediator_specs) {
+
+    run_key <- paste(pred$label, spec$name, sep = " -> ")
+    cat("\n>>> Starting", run_key, "at", format(Sys.time()), "\n")
+
+    out <- tryCatch(
+      run_juvenile_mediation_bayesian_joint_eigen(
+        emigrants_full, pred$posteriors, pred$field, pred$label, spec,
+        num_draws = 1000, chains = 2, iter = 2000, warmup = 1000
+      ),
+      error = function(e) {
+        cat("  ERROR for", run_key, ":", e$message, "\n")
+        NULL
+      }
+    )
+
+    if (!is.null(out)) {
+      all_results_juv[[run_key]] <- out$summary
+      all_pooled_juv[[run_key]]  <- out$pooled_posterior
+
+      tryCatch({
+        saveRDS(all_results_juv,
+                file.path(data_dir, "juvenile_mediation_results_bayesian_ALL_PARTIAL.rds"))
+        saveRDS(all_pooled_juv,
+                file.path(data_dir, "juvenile_mediation_pooled_posteriors_ALL_PARTIAL.rds"))
+        cat("  Saved progress after", run_key, "\n")
+      }, error = function(e) cat("  WARNING: save failed after", run_key, "-", e$message, "\n"))
+    }
+  }
+}
+
+full_summary_juv <- bind_rows(all_results_juv)
+
+# Back up the existing file before overwriting it - it may still hold
+# results from an earlier version of predictor_list (see conversation
+# history: this file previously had "Mother grooming eigen-centrality"
+# rows from a prior run even though predictor_list didn't produce them
+# this session).
+existing_csv <- file.path(data_dir, "juvenile_mediation_all_predictors_bayesian.csv")
+if (file.exists(existing_csv)) {
+  file.copy(existing_csv,
+            file.path(data_dir, paste0("juvenile_mediation_all_predictors_bayesian_backup_",
+                                        format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv")),
+            overwrite = FALSE)
+}
+
+write.csv(full_summary_juv,
+          file.path("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/juvenile_mediation_all_predictors_bayesian.csv"),
+          row.names = FALSE)
+saveRDS(all_pooled_juv,
+        file.path(data_dir, "juvenile_mediation_pooled_posteriors_all_predictors.rds"))
+
+cat("\nDone. Final results saved:",
+    file.path(data_dir, "juvenile_mediation_all_predictors_bayesian.csv"), "\n")
+print(as.data.frame(full_summary_juv), row.names = FALSE)
+
+# Sample sizes per predictor
+full_summary_juv %>%
+  distinct(predictor, mediator, n) %>%
+  arrange(predictor, mediator) %>%
+  print(n = Inf)
+
+# Credible effects only (95% CI excludes zero)
+full_summary_juv %>%
+  filter(sign(network_q025) == sign(network_q975)) %>%
+  arrange(predictor, mediator, path) %>%
+  print(n = Inf)
+```
+Higher ranking mothers have sons with higher frequency of proximity interactions
+(mean β = 0.387, 95% CI [0.022, 0.751], pd = 98.1%)
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+full_summary_juv <- read.csv(file.path(data_dir, "juvenile_mediation_all_predictors_bayesian.csv"))
+
+predictor_label_map <- c(
+  "Maternal grooming investment"      = "Maternal grooming investment",
+  "Maternal proximity investment"     = "Maternal proximity investment",
+  "Maternal rank"                     = "Maternal rank",
+  "Mother grooming eigen-centrality"  = "Mother grooming eigen-centrality",
+  "Mother proximity eigen-centrality" = "Mother proximity eigen-centrality"
+)
+
+mediator_label_map <- c(
+  "prox_strength_juv"      = "Prox strength",
+  "prox_degree_juv"        = "Prox degree",
+  "groom_out_strength_juv" = "Groom out-strength",
+  "groom_in_strength_juv"  = "Groom in-strength",
+  "groom_out_degree_juv"   = "Groom out-degree",
+  "groom_in_degree_juv"    = "Groom in-degree"
+)
+
+plot_data_juv <- full_summary_juv %>%
+  filter(path == "a (predictor -> juvenile mediator)", predictor != "Maternal presence") %>%
+  mutate(
+    predictor_label = predictor_label_map[predictor],
+    mediator_label   = mediator_label_map[mediator],
+    predictor_label  = ifelse(is.na(predictor_label), predictor, predictor_label),
+    mediator_label   = ifelse(is.na(mediator_label), mediator, mediator_label),
+    excludes_zero = sign(network_q025) == sign(network_q975),
+    direction = ifelse(estimate_mean > 0, "Positive", "Negative"),
+    ci_type = ifelse(excludes_zero, "solid", "dashed")
+  ) %>%
+  arrange(predictor, desc(estimate_mean))
+
+plot_data_juv$mediator_label <- factor(
+  plot_data_juv$mediator_label,
+  levels = unique(plot_data_juv$mediator_label[order(plot_data_juv$estimate_mean)])
+)
+
+ggplot(plot_data_juv, aes(x = mediator_label, y = estimate_mean, color = direction)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_linerange(aes(ymin = network_q025, ymax = network_q975, linetype = ci_type),
+                 linewidth = 0.9) +
+  geom_point(size = 2.2) +
+  scale_linetype_identity() +
+  facet_wrap(~ predictor_label, scales = "free", ncol = 2) +
+  scale_color_manual(values = c("Positive" = "#2E7D32", "Negative" = "#C62828"), name = NULL) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Posterior mean and 95% network-draw range"
+  ) +
+  theme_minimal(base_size = 17) +
+  theme(
+    strip.text = element_text(face = "plain"),
+    strip.background = element_rect(fill = "grey95", color = "grey40", linewidth = 0.5),
+    panel.border = element_rect(color = "grey40", fill = NA, linewidth = 0.5),
+    panel.spacing = unit(1, "lines"),
+    legend.position = "none"
+  )
+```
+
+

@@ -1,0 +1,1209 @@
+---
+title: "immigrants_selection"
+author: "Alba Motes Rodrigo"
+date: "2025-03-27"
+output: html_document
+---
+
+```{r}
+library(EloRating)
+library(stringr)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+
+
+#load life history dataset
+life_hist<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/life_history.csv")
+
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Analyses/elo_rating_male_calculator.R")
+
+life_hist$Code<-tolower(life_hist$Code)
+
+# First, ensure all date columns are in proper Date format
+date_columns <- c("DOB", "FirstRecorded", "LastSeen1", "DepartureNatalGp", 
+                 "DateImmigration1", "LastSeen2", "DateImmigration2",
+                 "LastSeen3", "DateImmigration3", "DateImmigration4", "LastSeen4", "DateAdult")
+
+for (col in date_columns) {
+  if (col %in% colnames(life_hist)) {
+    # Check if column is character type before converting
+    if (is.character(life_hist[[col]])) {
+      # Try the ISO format first (YYYY-MM-DD)
+      life_hist[[col]] <- as.Date(life_hist[[col]], format = "%Y-%m-%d")
+      
+      # If that results in all NAs, try the alternative format (DD/MM/YYYY)
+      if (all(is.na(life_hist[[col]]))) {
+        life_hist[[col]] <- as.Date(life_hist[[col]], format = "%d/%m/%Y")
+      }
+    }
+  }
+}
+#fix spelling
+life_hist$Mother[life_hist$Mother == "Nkosikazi"] <- "Nkosikasi"
+#remove white spaces
+life_hist <- life_hist %>%
+  mutate(across(starts_with("ImmigrationGp"), trimws),
+         across(starts_with("BirthGp"),       trimws))
+#remove duplicated riga
+life_hist <- life_hist %>%
+  group_by(Code) %>%
+  slice(1) %>%
+  ungroup()
+```
+
+#Fix mispellings of Mother names vs their Individual names
+```{r}
+library(stringdist)
+
+self_names   <- life_hist %>% distinct(Individual) %>% pull(Individual)
+mother_names <- life_hist %>% distinct(Mother) %>% filter(!is.na(Mother)) %>% pull(Mother)
+
+# For every Mother spelling with no exact match in Individual, find the closest one
+unmatched <- mother_names[!mother_names %in% self_names]
+
+near_misses <- tibble(Mother_spelling = unmatched) %>%
+  rowwise() %>%
+  mutate(
+    closest_Individual = self_names[which.min(stringdist(Mother_spelling, self_names, method = "lv"))],
+    distance = min(stringdist(Mother_spelling, self_names, method = "lv"))
+  ) %>%
+  ungroup() %>%
+  filter(distance <= 2) %>%
+  arrange(distance)
+
+near_misses
+
+# Build correction lookup: closest_Individual is the "correct" (canonical) spelling
+corrections <- near_misses %>%
+  mutate(Mother_spelling = trimws(Mother_spelling)) %>%  # handles the "Nooiens " case
+  dplyr::select(Mother_spelling, closest_Individual) %>%
+  distinct()
+
+corrections
+
+life_hist <- life_hist %>%
+  mutate(Mother = trimws(Mother)) %>%  # trim whitespace first (fixes "Nooiens ")
+  left_join(corrections, by = c("Mother" = "Mother_spelling")) %>%
+  mutate(Mother = if_else(!is.na(closest_Individual), closest_Individual, Mother)) %>%
+  dplyr::select(-closest_Individual)
+
+```
+
+#Create presence/absence matrices of individuals in each group
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+
+build_presence_matrix <- function(life_hist,
+                                  group_name,
+                                  start_date = "2010-06-24",  # IVP start date
+                                  end_date   = Sys.Date()) {
+  
+  # ── 1. Filter individuals who ever belonged to this group ──────────────────
+  group_individuals <- life_hist %>%
+    filter(
+      BirthGp        == group_name |
+      ImmigrationGp1 == group_name |
+      ImmigrationGp2 == group_name |
+      ImmigrationGp3 == group_name |
+      ImmigrationGp4 == group_name
+    )
+  
+  if (nrow(group_individuals) == 0) {
+    warning(paste("No individuals found for group:", group_name))
+    return(NULL)
+  }
+  
+  # ── 2. Determine start date for the group ──────────────────────────────────
+  # Priority: earliest DOB of natal individuals > earliest immigration date > FirstRecorded
+  birth_dates <- life_hist %>%
+    filter(BirthGp == group_name, !is.na(DOB)) %>%
+    pull(DOB)
+  
+  if (length(birth_dates) > 0) {
+    start_date <- min(birth_dates)
+  } else {
+    imm_dates <- life_hist %>%
+      pivot_longer(
+        cols      = matches("^ImmigrationGp\\d+$"),
+        names_to  = "imm_col",
+        values_to = "imm_group"
+      ) %>%
+      filter(imm_group == group_name) %>%
+      mutate(
+        event_num = str_extract(imm_col, "\\d+"),
+        date_col  = paste0("DateImmigration", event_num)
+      ) %>%
+      rowwise() %>%
+      mutate(imm_date = get(date_col)) %>%
+      ungroup() %>%
+      filter(!is.na(imm_date)) %>%
+      pull(imm_date)
+    
+    if (length(imm_dates) > 0) {
+      start_date <- min(imm_dates)
+    } else {
+      warning(paste("No birth or immigration dates for group:", group_name,
+                    "- using earliest FirstRecorded"))
+      start_date <- min(life_hist$FirstRecorded, na.rm = TRUE)
+    }
+  }
+  
+  end_date <- as.Date(end_date)
+  
+  # ── 3. Build presence intervals per individual ─────────────────────────────
+  # get_intervals is nested here so it can access group_name and end_date
+  
+  get_intervals <- function(ind) {
+    
+    intervals <- list()
+    
+    # ── 3a. Natal interval ────────────────────────────────────────────────
+    if (!is.na(ind$BirthGp) && ind$BirthGp == group_name) {
+      
+      start_pres <- if (!is.na(ind$DOB)) ind$DOB else ind$FirstRecorded
+      
+      end_pres <- case_when(
+        # Male departed natal group
+        !is.na(ind$Sex) & ind$Sex == "M" & !is.na(ind$DepartureNatalGp)
+          ~ as.Date(ind$DepartureNatalGp),
+        # Individual died (has LastSeen1 but no further immigration)
+        !is.na(ind$LastSeen1) & is.na(ind$DateImmigration1)
+          ~ as.Date(ind$LastSeen1),
+        # Still present
+        TRUE ~ as.Date(end_date)
+      )
+      
+      intervals <- c(intervals, list(c(start_pres, end_pres)))
+    }
+    
+    # ── 3b. Immigration intervals ─────────────────────────────────────────
+    for (k in 1:4) {
+      
+      grp_col  <- paste0("ImmigrationGp",   k)
+      date_col <- paste0("DateImmigration", k)
+      ls_col   <- paste0("LastSeen",        k)
+      
+      # Skip if this immigration was not to our group or has no date
+      if (is.na(ind[[grp_col]]) || ind[[grp_col]] != group_name) next
+      if (is.na(ind[[date_col]])) next
+      
+      start_pres <- as.Date(ind[[date_col]])
+      
+      # Only look for next immigration date if k < 4 (DateImmigration5 does not exist)
+      next_date <- if (k < 4) {
+        next_col <- paste0("DateImmigration", k + 1)
+        if (!is.na(ind[[next_col]])) as.Date(ind[[next_col]]) else NA_Date_
+      } else {
+        NA_Date_
+      }
+      
+      end_pres <- case_when(
+        !is.na(next_date)      ~ next_date,
+        !is.na(ind[[ls_col]]) ~ as.Date(ind[[ls_col]]),
+        TRUE                   ~ as.Date(end_date)
+      )
+      
+      intervals <- c(intervals, list(c(start_pres, end_pres)))
+    }
+    
+    # Return as tidy dataframe of intervals
+    if (length(intervals) == 0) return(NULL)
+    
+    map_dfr(intervals, ~ tibble(
+      Code  = ind$Code,
+      start = as.Date(.x[1]),
+      end   = as.Date(.x[2])
+    ))
+  }
+  
+  # Apply get_intervals to all individuals
+  all_intervals <- group_individuals %>%
+    rowwise() %>%
+    group_split() %>%
+    map(get_intervals) %>%
+    bind_rows()
+  
+  if (nrow(all_intervals) == 0) {
+    warning(paste("No valid presence intervals for group:", group_name))
+    return(NULL)
+  }
+  
+  # ── 4. Build date sequence and expand to presence matrix ───────────────────
+  date_seq <- tibble(Date = seq(start_date, end_date, by = "day"))
+  
+  presence_matrix <- date_seq %>%
+    crossing(all_intervals) %>%
+    filter(Date >= start, Date <= end) %>%
+    distinct(Date, Code) %>%
+    mutate(present = 1L) %>%
+    pivot_wider(
+      names_from  = Code,
+      values_from = present,
+      values_fill = 0L
+    ) %>%
+    arrange(Date)
+  
+  return(presence_matrix)
+}
+
+# ── Wrapper to run for all groups ──────────────────────────────────────────────
+build_all_presence_matrices <- function(life_hist,
+                                        groups   = c("IF", "KB", "BD", "CR", "LT", "NH", "AK"),
+                                        end_date = Sys.Date()) {
+  matrices <- list()
+  
+  for (grp in groups) {
+    result <- tryCatch(
+      build_presence_matrix(life_hist, grp, end_date),
+      error = function(e) {
+        warning(paste("Error processing group:", grp, "-", e$message))
+        NULL
+      }
+    )
+    if (!is.null(result)) matrices[[grp]] <- result
+  }
+  
+  return(matrices)
+}
+
+# Usage:
+ group_presence_matrices <- build_all_presence_matrices(life_hist)
+ View(group_presence_matrices[["AK"]])
+```
+
+#clean presence matrices
+```{r}
+# Remove any columns with NA names (individuals with missing Code)
+group_presence_matrices <- lapply(group_presence_matrices, function(mat) {
+  if (any(is.na(colnames(mat)))) {
+    mat[, !is.na(colnames(mat))]
+  } else {
+    mat
+  }
+})
+group_presence_matrices <- lapply(group_presence_matrices, as.data.frame)
+
+#save_group_presence_matrices
+```
+
+```{r}
+analyze_male_emigration <- function(life_hist, group_presence_matrices) {
+  
+  # Step 1: Filter males who emigrated
+ emigrant_males <- life_hist %>%
+  filter(Sex == "M",
+         !is.na(ImmigrationGp1),
+         !is.na(DateImmigration1) | !is.na(DepartureNatalGp)) %>%
+  mutate(
+    Tenure = if_else(!is.na(DateImmigration1),
+                      if_else(!is.na(LastSeen1),
+                              as.numeric(LastSeen1 - DateImmigration1),
+                              as.numeric(Sys.Date() - DateImmigration1)),
+                      NA_real_),
+    juvenile_period_end = case_when(
+      !is.na(DepartureNatalGp) ~ as.Date(DepartureNatalGp),
+      is.na(DepartureNatalGp) & !is.na(DateImmigration1) ~ as.Date(DateImmigration1),
+      TRUE ~ as.Date(NA)
+    ),
+    juvenile_period_length_days = as.numeric(juvenile_period_end - DOB)
+  )
+  
+# Step 2: Apply mother presence check row by row using a loop
+  results <- emigrant_males
+  results$mother_present_at_dispersal <- NA
+  results$mother_days_present <- NA
+  results$mother_presence_proportion <- NA
+
+  for (i in 1:nrow(results)) {
+    # Skip if no mother info or DOB
+    mother_name <- results$Mother[i]
+    if (is.na(mother_name) || mother_name == "" || mother_name == " " || is.na(results$DOB[i])) {
+      results$mother_present_at_dispersal[i] <- NA
+      results$mother_days_present[i] <- NA
+      results$mother_presence_proportion[i] <- NA
+      next
+    }
+
+    natal_group <- results$BirthGp[i]
+    mother_code <- life_hist$Code[life_hist$Individual == mother_name][1]
+    dob <- results$DOB[i]
+    period_end <- results$juvenile_period_end[i]
+
+    # Check if we have valid data
+    if (is.na(natal_group) || !natal_group %in% names(group_presence_matrices) ||
+        is.na(mother_code) || length(mother_code) == 0 || is.na(period_end)) {
+      results$mother_present_at_dispersal[i] <- FALSE
+      results$mother_days_present[i] <- 0
+      results$mother_presence_proportion[i] <- NA
+      next
+    }
+
+    presence_matrix <- group_presence_matrices[[natal_group]]
+
+    # Check if mother is in the matrix
+    if (!mother_code %in% colnames(presence_matrix)) {
+      results$mother_present_at_dispersal[i] <- FALSE
+      results$mother_days_present[i] <- 0
+      results$mother_presence_proportion[i] <- NA
+      next
+    }
+
+    # Get relevant dates
+    relevant_dates <- presence_matrix %>%
+      filter(Date >= dob & Date <= period_end)
+
+    if (nrow(relevant_dates) == 0) {
+      results$mother_present_at_dispersal[i] <- FALSE
+      results$mother_days_present[i] <- 0
+      results$mother_presence_proportion[i] <- NA
+    } else {
+      days_present <- sum(relevant_dates[[mother_code]] == 1, na.rm = TRUE)
+      total_days   <- nrow(relevant_dates)
+
+      results$mother_days_present[i] <- days_present
+      results$mother_presence_proportion[i] <- days_present / total_days
+      results$mother_present_at_dispersal[i] <- all(relevant_dates[[mother_code]] == 1, na.rm = TRUE)
+    }
+  }
+
+  results <- results %>%
+  select(Code, Mother, BirthGp, DOB, ImmigrationGp1, DateImmigration1, DepartureNatalGp,
+         LastSeen1, Tenure, juvenile_period_end, juvenile_period_length_days,
+         mother_present_at_dispersal, mother_days_present, mother_presence_proportion)
+
+  return(results)
+}
+
+emigrants <- analyze_male_emigration(life_hist, group_presence_matrices)
+```
+
+```{r}
+emigrants<-emigrants %>% 
+  mutate(across(where(is.character), str_trim))
+ # Initialize Momcode column
+  emigrants$Momcode <- NA_character_
+  
+  # Loop through each row in potential_immig
+  for(i in 1:nrow(emigrants)) {
+    # Get the mother's name
+    mom_name <- emigrants$Mother[i]
+    
+    # Find the mother's code in life_hist
+    mom_idx <- which(life_hist$Individual == mom_name)
+    
+    # If found, add the code
+    if(length(mom_idx) > 0) {
+      emigrants$Momcode[i] <- life_hist$Code[mom_idx[1]]
+    }
+  }
+
+```
+
+#calculate winner/loser matrices 
+```{r}
+newest_aggression_data<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/adlib/agonistic.csv")
+#put date in correct format
+newest_aggression_data$date <- as.Date(newest_aggression_data$date)
+
+#change column names
+colnames(newest_aggression_data)[(names(newest_aggression_data) == "idindividual1")] <- "Aggressor"
+colnames(newest_aggression_data)[(names(newest_aggression_data) == "idindividual2")] <- "Victim"
+colnames(newest_aggression_data)[(names(newest_aggression_data) == "behaviourindiv1")] <- "AggressorBehaviour"
+colnames(newest_aggression_data)[(names(newest_aggression_data) == "behaviourindiv2")] <- "VictimBehaviour"
+```
+
+This section builds a winner-loser table from agonistic interactions using:
+- Tiered aggression winner/loser logic (adapted from Tankink/Mercier)
+- Actual daily presence filtering via presence matrices
+- Age class assignment at time of conflict
+
+```{r group-name-mapping}
+# Map long group names to codes used in presence matrices
+group_code_map <- c(
+  "Ankhase"     = "AK",
+  "Baie Dankie" = "BD",
+  "Noha"        = "NH",
+  "Kubu"        = "KB",
+  "Lemon Tree"  = "LT",
+  "IFamily"     = "IF",
+  "Crossing"    = "CR"
+)
+
+long_to_code <- function(name) {
+  ifelse(name %in% names(group_code_map), group_code_map[name], name)
+}
+```
+
+```{r tiered-winner-loser-logic}
+# Tiered winner/loser decision
+# Priority: retreat/submission asymmetry > severe aggression > chase > mild aggression
+# Returns: 1 if beh1 wins, 2 if beh2 wins, 0 if draw
+
+decide_win_factory <- function() {
+  
+  # Retreat / submission codes (merged from both scripts)
+  retreat <- c("fl", "rt", "av", "ja", "cr", "ss", "gu", "re", "le", "sc")
+  
+  # Aggression tiers: severe -> chase -> mild
+  cat3 <- c("bi", "gb", "hi", "fi", "hh", "so", "fm")          # severe
+  cat2 <- c("ch")                                                # chase
+  cat1 <- c("ac", "ag", "at", "dp", "tp", "st", "su",
+             "fh", "sf", "hb", "bd", "ap")                      # mild
+  
+  # Count occurrences of any code from a set in a behaviour string
+  count_set <- function(s, codes) {
+    s <- tolower(paste0(s, collapse = " "))
+    sum(vapply(codes, function(cd) str_count(s, fixed(cd)), integer(1)))
+  }
+  
+  function(beh1, beh2) {
+    # 1) Retreat/submission asymmetry
+    r1 <- count_set(beh1, retreat)
+    r2 <- count_set(beh2, retreat)
+    if (r1 > r2) return(2L)  # beh1 retreated more -> beh2 wins
+    if (r2 > r1) return(1L)  # beh2 retreated more -> beh1 wins
+    
+    # 2) Tiered aggression comparison (severe first, then chase, then mild)
+    for (cats in list(cat3, cat2, cat1)) {
+      c1 <- count_set(beh1, cats)
+      c2 <- count_set(beh2, cats)
+      if (c1 > c2) return(1L)
+      if (c2 > c1) return(2L)
+    }
+    
+    # 3) Fully tied -> draw
+    return(0L)
+  }
+}
+
+decide_win <- decide_win_factory()
+```
+
+
+The age estimation works like this:
+
+If DOB is known: age = (target_date - DOB) in years. Straightforward.
+If DOB is unknown but FirstRecorded exists: age = (target_date - FirstRecorded) in years. This underestimates true age because FirstRecorded is when researchers first saw them, not when they were born.
+If DOB is unknown AND BirthGp is unknown (i.e., the individual was first observed as an immigrant with no birth records): add 5 years to the estimate from step 2. This is because these individuals are almost certainly adult males who immigrated from unmonitored groups. They were likely 4-5+ years old when first recorded, so adding 5 years compensates for the underestimation. Without this, a male first seen 6 months ago would get age = 0.5 and be classified as "BB" — obviously wrong for an immigrant male.
+
+```{r age-helper-functions}
+# Calculate age in years at a given date
+calculate_age <- function(date_of_birth, first_recorded, target_date, birthgp) {
+  base <- ifelse(
+    is.na(date_of_birth),
+    as.numeric(difftime(target_date, first_recorded, units = "weeks")) / 52.143,
+    as.numeric(difftime(target_date, date_of_birth,  units = "weeks")) / 52.143
+  )
+  base + ifelse(is.na(date_of_birth) & is.na(birthgp), 5, 0)
+}
+ 
+get_age_class <- function(Sex, Age, departure_natal, target_date,
+                          present_gp, birth_gp, date_adult = NA) {
+  case_when(
+    is.na(Sex) ~ NA_character_,
+    # DateAdult check FIRST — overrides missing age
+    !is.na(date_adult) & target_date >= date_adult & Sex == "F" ~ "AF",
+    !is.na(date_adult) & target_date >= date_adult & Sex == "M" ~ "AM",
+    # Now check for missing age
+    is.na(Age) ~ NA_character_,
+    # Standard age-based classification
+    Age < 1                                                        ~ "BB",
+    Sex == "F" & Age >= 3                                          ~ "AF",
+    Sex == "F" & Age >= 1 & Age < 3                                ~ "JF",
+    Sex == "M" & Age >= 1 & Age < 4                                ~ "JM",
+    Sex == "M" & Age >= 4 & (present_gp == birth_gp)               ~ "SM",
+    Sex == "M" & Age >= 4 & Age < 5 &
+      (is.na(departure_natal) | departure_natal <= target_date)    ~ "AM",
+    Sex == "M" & Age >= 5                                           ~ "AM",
+    TRUE                                                           ~ NA_character_
+  )
+}
+```
+
+```{r build-winner-loser}
+# Build raw winner-loser table from agonistic data
+# Uses tiered decision logic defined above
+
+build_winner_loser <- function(agonistic_data) {
+  
+  agonistic_data %>%
+    transmute(
+      date      = as.Date(date),
+      group     = long_to_code(as.character(group)),
+      Aggressor = tolower(as.character(Aggressor)),
+      Victim    = tolower(as.character(Victim)),
+      BehAgg    = tolower(as.character(AggressorBehaviour)),
+      BehVic    = tolower(as.character(VictimBehaviour))
+    ) %>%
+    mutate(
+      who_wins = mapply(decide_win, BehAgg, BehVic),
+      winner   = case_when(who_wins == 1 ~ Aggressor,
+                           who_wins == 2 ~ Victim,
+                           TRUE          ~ NA_character_),
+      loser    = case_when(who_wins == 1 ~ Victim,
+                           who_wins == 2 ~ Aggressor,
+                           TRUE          ~ NA_character_)
+    ) %>%
+    filter(!is.na(winner), !is.na(loser), winner != loser) %>%
+    dplyr::select(date, group, winner, loser, BehAgg, BehVic) %>%
+    arrange(date)
+}
+```
+
+```{r filter-by-presence}
+# Filter conflicts to only those where both individuals were actually present
+# on the exact date of the conflict (checked against daily presence matrices)
+
+filter_conflicts_by_presence <- function(conflict_data, group_presence_matrices) {
+  
+  results <- list()
+  
+  for (grp in unique(conflict_data$group)) {
+    
+    if (!grp %in% names(group_presence_matrices)) next
+    
+    group_conflicts <- conflict_data %>% filter(group == grp)
+    
+    presence <- group_presence_matrices[[grp]] %>%
+      mutate(Date = as.Date(Date))
+    
+    present_individuals <- setdiff(colnames(presence), "Date")
+    
+    # Keep only conflicts where both individuals exist in the presence matrix
+    group_conflicts <- group_conflicts %>%
+      filter(winner %in% present_individuals,
+             loser  %in% present_individuals)
+    
+    if (nrow(group_conflicts) == 0) next
+    
+    # Check actual presence value (== 1) on the conflict date
+    valid <- vapply(seq_len(nrow(group_conflicts)), function(i) {
+      
+      conflict_date <- group_conflicts$date[i]
+      w             <- group_conflicts$winner[i]
+      l             <- group_conflicts$loser[i]
+      
+      date_row <- presence[presence$Date == conflict_date, ]
+      
+      if (nrow(date_row) == 0) return(FALSE)
+      
+      isTRUE(date_row[[w]] == 1) & isTRUE(date_row[[l]] == 1)
+      
+    }, logical(1))
+    
+    results[[grp]] <- group_conflicts[valid, ]
+  }
+  
+  bind_rows(results)
+}
+```
+
+
+```{r add-age-classes}
+# Add age and sex class for winner and loser at the time of each conflict
+add_age_classes <- function(conflict_data, life_hist) {
+ 
+  # Standardise BirthGp to codes so it matches conflict_data$group
+  LH_min <- life_hist %>%
+    mutate(BirthGp = long_to_code(BirthGp)) %>%
+    dplyr::select(Code, Sex, DOB, FirstRecorded, BirthGp, DepartureNatalGp, DateAdult)
+ 
+  conflict_data %>%
+    # Winner demographics
+    left_join(LH_min, by = c("winner" = "Code")) %>%
+    rename(WinnerSex = Sex, W_DOB = DOB, W_FR = FirstRecorded,
+           W_BirthGp = BirthGp, W_DepNat = DepartureNatalGp,
+           W_DateAdult = DateAdult) %>%
+    mutate(
+      WinnerAge      = calculate_age(W_DOB, W_FR, date, W_BirthGp),
+      winner_age_cat = get_age_class(WinnerSex, WinnerAge, W_DepNat,
+                                     date, group, W_BirthGp, W_DateAdult)
+    ) %>%
+    dplyr::select(-W_DOB, -W_FR, -W_BirthGp, -W_DepNat, -W_DateAdult) %>%
+    # Loser demographics
+    left_join(LH_min, by = c("loser" = "Code")) %>%
+    rename(LoserSex = Sex, L_DOB = DOB, L_FR = FirstRecorded,
+           L_BirthGp = BirthGp, L_DepNat = DepartureNatalGp,
+           L_DateAdult = DateAdult) %>%
+    mutate(
+      LoserAge      = calculate_age(L_DOB, L_FR, date, L_BirthGp),
+      loser_age_cat = get_age_class(LoserSex, LoserAge, L_DepNat,
+                                    date, group, L_BirthGp, L_DateAdult)
+    ) %>%
+    dplyr::select(-L_DOB, -L_FR, -L_BirthGp, -L_DepNat, -L_DateAdult)
+}
+ 
+```
+
+```{r run-pipeline}
+# Run the full pipeline
+# age_classes_to_keep: adjust to "AF", "AM", "JM", "SM" etc. as needed
+
+conflict_data <- newest_aggression_data %>%
+  build_winner_loser() %>%
+  { message("After winner/loser decision: ", nrow(.), " interactions"); . } %>%
+  filter_conflicts_by_presence(group_presence_matrices) %>%
+  { message("After presence filter: ", nrow(.), " interactions"); . } %>%
+  add_age_classes(life_hist) %>%
+  filter(!is.na(winner_age_cat), !is.na(loser_age_cat))  # drop unclassifiable only
+
+message("Final dataset: ", nrow(conflict_data), " interactions")
+```
+After winner/loser decision: 50648 interactions
+After presence filter: 46696 interactions
+Final dataset: 46593 interactions
+
+```{r}
+# Breakdown of agonistic rows dropped by build_winner_loser()
+# Run inside the Rmd after the "run-pipeline" chunk and after CR has been removed.
+# Uses: newest_aggression_data, decide_win, long_to_code, filter_conflicts_by_presence,
+#       add_age_classes, group_presence_matrices, life_hist, conflict_data
+
+# 1. Classify every row of the raw data (same cleaning as build_winner_loser)
+ag <- newest_aggression_data %>%
+  transmute(
+    date      = as.Date(date),
+    group     = long_to_code(as.character(group)),
+    Aggressor = tolower(as.character(Aggressor)),
+    Victim    = tolower(as.character(Victim)),
+    BehAgg    = tolower(as.character(AggressorBehaviour)),
+    BehVic    = tolower(as.character(VictimBehaviour))
+  ) %>%
+  mutate(
+    who_wins = mapply(decide_win, BehAgg, BehVic),
+    status = case_when(
+      is.na(Aggressor) | is.na(Victim) | Aggressor == "" | Victim == "" ~ "missing ID",
+      str_detect(Aggressor, ";") | str_detect(Victim, ";")             ~ "coalition",
+      Aggressor == Victim                                               ~ "same ID",
+      who_wins == 0 & (is.na(BehAgg) | is.na(BehVic))                   ~ "undecided: behaviour missing",
+      who_wins == 0                                                     ~ "undecided",
+      TRUE                                                              ~ "decided"
+    )
+  )
+
+# Whole dataset (all age-sex classes)
+count(ag, status) %>% mutate(prop = round(n / sum(n), 3))
+
+# 2. Adult male - adult male conflicts only, both males present in the group that day
+#    Aggressor/Victim are copied into winner/loser only so the existing helper
+#    functions can classify the dyad; outcome is taken from `status`.
+mm <- ag %>%
+  filter(status %in% c("decided", "undecided", "undecided: behaviour missing")) %>%
+  mutate(winner = Aggressor, loser = Victim) %>%
+  filter_conflicts_by_presence(group_presence_matrices) %>%
+  add_age_classes(life_hist) %>%
+  filter(winner_age_cat == "AM", loser_age_cat == "AM")
+
+count(mm, status) %>% mutate(prop = round(n / sum(n), 3))
+
+# 3. Per-male wins and losses in decided AM-AM conflicts
+#    (for "do some males rarely show submission?")
+am <- conflict_data %>% filter(winner_age_cat == "AM", loser_age_cat == "AM")
+
+male_outcomes <- bind_rows(
+  am %>% count(id = winner, name = "n") %>% mutate(type = "won"),
+  am %>% count(id = loser,  name = "n") %>% mutate(type = "lost")
+) %>%
+  tidyr::pivot_wider(names_from = type, values_from = n, values_fill = 0) %>%
+  mutate(total = won + lost, prop_won = won / total) %>%
+  arrange(desc(prop_won))
+
+male_outcomes
+summary(male_outcomes$prop_won)
+sum(male_outcomes$lost == 0)  # males never seen losing to another adult male
+```
+
+
+##subset only adult females to create only female conflict dataset
+```{r}
+# Create the adult female-only conflicts dataframe
+female_conflict_data <- conflict_data[
+  !is.na(conflict_data$winner_age_cat) & conflict_data$winner_age_cat == "AF" &
+  !is.na(conflict_data$loser_age_cat) & conflict_data$loser_age_cat == "AF",
+]
+```
+
+#check conflict data
+```{r}
+female_conflict_data <- female_conflict_data %>%
+  arrange(date)
+seqcheck(winner = female_conflict_data$winner, loser = female_conflict_data$loser, Date=female_conflict_data$date)
+```
+
+190 coalitions were excluded
+```{r}
+newest_aggression_data %>%
+     filter(str_detect(Aggressor, ";") | str_detect(Victim, ";")) %>%
+     nrow()
+```
+
+CR consistently gives problems so i am going to exclude it
+```{r}
+conflict_data <- conflict_data %>%
+  filter(group != "CR")
+
+emigrants <- emigrants %>%
+  filter(ImmigrationGp1 != "CR")
+
+group_presence_matrices[["CR"]] <- NULL
+```
+
+
+#Check for how many immigrant males we have enough data and calculate mom elos
+```{r}
+calculate_mother_elo <- function(potential_immig, conflict_data, 
+                                  group_presence_matrices, life_hist,
+                                  col_suffix = "") {
+  
+  library(EloRating)
+  library(lubridate)
+  
+  elo_col <- paste0("mother_avg_elo", col_suffix)
+  jpl_col <- paste0("juvenile_period_length", col_suffix)
+  
+  potential_immig <- potential_immig %>%
+    mutate(DOB = as.Date(DOB),
+           juvenile_period_end = as.Date(juvenile_period_end))  # was: third_birthday
+  
+  conflict_data <- conflict_data %>%
+    mutate(date = as.Date(date)) %>%
+    arrange(date)
+  
+  results <- potential_immig %>%
+    filter(!is.na(BirthGp)) %>%
+    group_by(BirthGp) %>%
+    group_split() %>%
+    map_dfr(function(group_data) {
+      
+      grp <- unique(group_data$BirthGp)
+      
+      presence <- group_presence_matrices[[grp]]
+      if (is.null(presence)) {
+        message("No presence data for group: ", grp)
+        return(group_data %>% mutate(!!elo_col := NA, !!jpl_col := NA))
+      }
+      
+      presence_individuals <- setdiff(colnames(presence), "Date")
+      
+      group_conflicts <- conflict_data %>%
+        filter(group == grp,
+               winner %in% presence_individuals,
+               loser  %in% presence_individuals)
+      
+      if (nrow(group_conflicts) == 0) {
+        message("No conflict data for group: ", grp)
+        return(group_data %>% mutate(!!elo_col := NA, !!jpl_col := NA))
+      }
+      
+      first_seen <- map_chr(presence_individuals, function(ind) {
+        idx <- which(presence[[ind]] > 0)
+        if (length(idx) > 0) as.character(presence$Date[min(idx)]) else "9999-12-31"
+      }) %>% setNames(presence_individuals)
+      
+      group_conflicts <- group_conflicts %>%
+        filter(date >= as.Date(first_seen[winner]),
+               date >= as.Date(first_seen[loser]))
+      
+      elo_ratings <- tryCatch(
+        elo.seq(winner   = group_conflicts$winner,
+                loser    = group_conflicts$loser,
+                Date     = group_conflicts$date,
+                draw     = NULL,
+                presence = presence,
+                runcheck = FALSE),
+        error = function(e) {
+          message("Error calculating Elo for group ", grp, ": ", e$message)
+          NULL
+        }
+      )
+      
+      if (is.null(elo_ratings)) {
+        return(group_data %>% mutate(!!elo_col := NA, !!jpl_col := NA))
+      }
+      
+      group_data %>%
+        mutate(result = pmap(list(Momcode, DOB, juvenile_period_end), function(mom, dob, period_end) {
+          
+          if (is.na(mom) || is.na(dob) || is.na(period_end))
+            return(list(elo = NA_real_, jpl = NA_real_))
+          
+          if (!mom %in% colnames(elo_ratings$pmat)) {
+            message("Mother ", mom, " not found in Elo ratings for group ", grp)
+            return(list(elo = NA_real_, jpl = NA_real_))
+          }
+          
+          end_dt         <- period_end   # was: dob + years(3)
+          first_elo_date <- as.Date(min(as.Date(elo_ratings$truedates)))
+          extract_start  <- max(dob, first_elo_date)
+          
+          if (extract_start >= end_dt)
+            return(list(elo = NA_real_, jpl = NA_real_))
+          
+          daterange <- as.numeric(difftime(end_dt, extract_start, units = "days"))
+          
+          ratings <- tryCatch(
+            extract_elo(elo_ratings,
+                        extractdate = format(extract_start, "%Y-%m-%d"),
+                        daterange   = daterange,
+                        IDs         = mom,
+                        standardize = TRUE),
+            error = function(e) NULL
+          )
+          
+          if (is.null(ratings) || length(ratings) == 0)
+            return(list(elo = NA_real_, jpl = daterange))
+          
+          list(elo = mean(ratings, na.rm = TRUE), jpl = daterange)
+        })) %>%
+        mutate(
+          !!elo_col := map_dbl(result, "elo"),
+          !!jpl_col := map_dbl(result, "jpl")
+        ) %>%
+        dplyr::select(-result)
+    })
+  
+  potential_immig %>%
+    filter(is.na(BirthGp)) %>%
+    mutate(!!elo_col := NA, !!jpl_col := NA) %>%
+    bind_rows(results)
+}
+```
+
+#Run the function twice to calculate mother ranks based on AF-AF conflicts only as well as all conflicts
+```{r}
+# AF-AF only maternal rank
+emigrants <- calculate_mother_elo(potential_immig = emigrants,
+                                   conflict_data = female_conflict_data,
+                                   group_presence_matrices, life_hist,
+                                   col_suffix = "")
+
+# AM-AF + AF-AF combined data set
+all_conflict_data <- conflict_data[
+  !is.na(conflict_data$winner_age_cat) & conflict_data$winner_age_cat %in% c("AF", "AM") &
+  !is.na(conflict_data$loser_age_cat)  & conflict_data$loser_age_cat  %in% c("AF", "AM") &
+  (conflict_data$winner_age_cat == "AF" | conflict_data$loser_age_cat == "AF"),
+]
+
+emigrants_all <- calculate_mother_elo(potential_immig = emigrants,
+                                       conflict_data = all_conflict_data,
+                                       group_presence_matrices, life_hist,
+                                       col_suffix = "_all")
+
+emigrants <- emigrants_all
+```
+
+```{r}
+mismatch_summary <- emigrants %>%
+  mutate(
+    has_afaf = !is.na(mother_avg_elo),
+    has_all  = !is.na(mother_avg_elo_all)
+  ) %>%
+  summarise(
+    both          = sum(has_afaf & has_all),
+    afaf_only     = sum(has_afaf & !has_all),
+    all_only      = sum(!has_afaf & has_all),
+    neither       = sum(!has_afaf & !has_all)
+  )
+
+mismatch_summary#calculating mom ranks one way or another doesn't change the number of mothers with elos
+
+cor.test(emigrants$mother_avg_elo, emigrants$mother_avg_elo_all, 
+         use = "pairwise.complete.obs", method = "spearman") #rho 0.98
+```
+
+#Check whether males are present in their ImmGp1 1 year after imm
+```{r}
+#create immigration birthday
+emigrants$ImmigBirthday1 <- if_else(
+  !is.na(emigrants$DateImmigration1),
+  as.Date(emigrants$DateImmigration1) + 365,
+  as.Date(emigrants$DepartureNatalGp) + 365
+)
+
+check_immigration_presence <- function(potential_immig, group_presence_matrices) {
+  potential_immig$IsPresentOnBirthday <- NA
+  
+  for (i in 1:nrow(potential_immig)) {
+    monkey_code <- potential_immig$Code[i]
+    immig_group <- potential_immig$ImmigrationGp1[i]
+    immig_date <- potential_immig$ImmigBirthday1[i]
+    
+    presence_matrix <- group_presence_matrices[[immig_group]]
+    
+    if (is.null(presence_matrix) || is.na(immig_date)) next
+    
+    date_row_index <- which(presence_matrix$Date == immig_date)
+    
+    if (length(date_row_index) == 0) {
+      warning(paste("Date", immig_date, "not found in presence matrix for group:", immig_group))
+      next
+    }
+    
+    if (!(monkey_code %in% colnames(presence_matrix))) {
+      warning(paste("Monkey", monkey_code, "not found in presence matrix for group:", immig_group))
+      is_present <- FALSE
+    } else {
+      col_index <- which(colnames(presence_matrix) == monkey_code)
+      is_present <- presence_matrix[date_row_index, col_index] == 1
+    }
+    
+    potential_immig$IsPresentOnBirthday[i] <- is_present
+  }
+  
+  return(potential_immig)
+}
+
+emigrants <- check_immigration_presence(potential_immig = emigrants, group_presence_matrices)
+```
+
+#Check whether males have any conflict in the year after immigration
+Both in general and just with males
+```{r}
+check_male_conflicts_after_immigration <- function(potential_immig, conflict_data) {
+  
+  potential_immig$HasConflictsAfterImmig <- FALSE
+  potential_immig$ConflictCountAfterImmig <- 0
+  
+  for (i in 1:nrow(potential_immig)) {
+    male_id <- potential_immig$Code[i]
+    immig_group <- potential_immig$ImmigrationGp1[i]
+    
+    immig_date <- if (!is.na(potential_immig$DateImmigration1[i])) {
+      potential_immig$DateImmigration1[i]
+    } else {
+      as.Date(potential_immig$DepartureNatalGp[i])
+    }
+    
+    if (is.na(immig_date) || is.na(immig_group)) next
+    
+    end_date <- immig_date + 365
+    
+    male_conflicts <- conflict_data[
+      (conflict_data$winner == male_id | conflict_data$loser == male_id) &
+      conflict_data$group == immig_group &
+      conflict_data$date >= immig_date &
+      conflict_data$date <= end_date &
+      !is.na(conflict_data$winner_age_cat) & conflict_data$winner_age_cat == "AM" &
+      !is.na(conflict_data$loser_age_cat) & conflict_data$loser_age_cat == "AM",
+    ]
+    
+    conflict_count <- nrow(male_conflicts)
+    has_conflicts <- conflict_count > 0
+    
+    potential_immig$HasConflictsAfterImmig[i] <- has_conflicts
+    potential_immig$ConflictCountAfterImmig[i] <- conflict_count
+  }
+  
+  return(potential_immig)
+}
+
+emigrants <- check_male_conflicts_after_immigration(potential_immig = emigrants, conflict_data)
+```
+
+#Calculate males elo_rating one year after immigration
+Two elos are created when the function is applied: one including all sex conflicts and one including only male-male conflicts (MMelo).We will calculate it at two time points
+```{r}
+#at 1 year post emigration
+emigrants <- calculate_elo_ratings(
+  emigrants, 
+  conflict_data, 
+  group_presence_matrices,
+  target_type = "birthday"
+)
+
+#at the end of tenure
+emigrants <- calculate_elo_ratings(
+  emigrants, 
+ conflict_data, 
+  group_presence_matrices,
+  target_type = "last_seen"
+)
+
+```
+Warning guide:
+No presence data — transient groups not in matrices
+No conflict data — males with no conflicts in their time window
+Individual X not found in Elo ratings — males who were present but never appeared in a conflict, will get NA
+Less than 2 conflicts — can't calculate sequence
+
+See how correlated the two elo ratings are
+```{r}
+cor.test(emigrants$elo_one_year_all, 
+    emigrants$elo_one_year_male_male, 
+    use = "complete.obs") #r= 0.78, p < 0.001
+```
+
+#relative rank comparison
+```{r}
+# For each group-immigration period, compute rank in both metrics
+# and check if the ordering is the same
+
+emigrants %>%
+  filter(!is.na(elo_one_year_all), !is.na(elo_one_year_male_male)) %>%
+  group_by(ImmigrationGp1) %>%
+  summarise(
+    n    = n(),
+    test = list(cor.test(elo_one_year_all, elo_one_year_male_male,
+                         method = "spearman", exact = FALSE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    spearman = sapply(test, function(x) unname(x$estimate)),
+    p_value  = sapply(test, function(x) x$p.value)
+  ) %>%
+  select(-test)
+```
+
+# Calculate date differences between Elo rating dates and target dates
+```{r}
+# For one_year Elo ratings: difference from immigration + 365 days (first birthday)
+emigrants$immigration_birthday <- if_else(
+  !is.na(emigrants$DateImmigration1),
+  as.Date(emigrants$DateImmigration1) + 365,
+  as.Date(emigrants$DepartureNatalGp) + 365
+)
+
+emigrants$days_diff_one_year_all <- as.numeric(
+  emigrants$immigration_birthday - emigrants$elo_rating_date_one_year_all
+)
+
+emigrants$days_diff_one_year_male_male <- as.numeric(
+  emigrants$immigration_birthday - emigrants$elo_rating_date_one_year_male_male
+)
+# For end_tenure Elo ratings: difference from LastSeen1
+#emigrants$days_diff_end_tenure_all <- as.numeric(
+#  emigrants$LastSeen1 - emigrants$elo_rating_date_end_tenure_all
+#)
+
+#emigrants$days_diff_end_tenure_male_male <- as.numeric(
+#  emigrants$LastSeen1 - emigrants$elo_rating_date_end_tenure_male_male
+#)
+
+cat("\n=== SUMMARY TABLE ===\n")
+summary(emigrants[, c("days_diff_one_year_all", 
+                      "days_diff_one_year_male_male"
+                      #"days_diff_end_tenure_all", 
+                      #"days_diff_end_tenure_male_male"
+                      )])
+
+```
+
+```{r}
+emigrants %>%
+     summarise(
+         n_total              = n(),
+        n_maternal_elo       = sum(!is.na(mother_avg_elo)),
+        n_own_elo_all        = sum(!is.na(elo_one_year_all)),
+        n_own_elo_mm         = sum(!is.na(elo_one_year_male_male)),
+        n_both_all           = sum(!is.na(mother_avg_elo) & !is.na(elo_one_year_all)),
+        n_both_mm            = sum(!is.na(mother_avg_elo) & !is.na(elo_one_year_male_male)))
+```
+n_total n_maternal_elo n_own_elo_all n_own_elo_mm n_both_all n_both_mm
+    <int>          <int>         <int>        <int>      <int>     <int>
+1     212             70           132          129         34        33
+```{r}
+emigrants %>%
+  summarise(
+    no_mother_name    = sum(is.na(Mother) | Mother == ""),
+    has_mother_name   = sum(!is.na(Mother) & Mother != ""),
+    has_mother_code   = sum(!is.na(Momcode)),
+    has_maternal_elo  = sum(!is.na(mother_avg_elo))
+  )
+```
+no_mother_name has_mother_name has_mother_code has_maternal_elo
+           <int>           <int>           <int>            <int>
+1            131              81              81               70
+
+```{r}
+emigrants %>%
+  filter(!is.na(Momcode), is.na(mother_avg_elo)) %>%
+  count(ImmigrationGp1, BirthGp)
+```
+
+```{r}
+write.csv(emigrants, "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/All_potential_immigrants_Josie_version.csv")
+```
+
+#save presence matrices
+```{r}
+saveRDS(group_presence_matrices, 
+        "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/group_presence_matrices.rds")
+```
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════
+# Diagnostic funnel: why do only 70/212 emigrants have mother_avg_elo?
+# Run this after your existing pipeline (needs: emigrants, life_hist,
+# group_presence_matrices, female_conflict_data all in memory)
+# ══════════════════════════════════════════════════════════════════════
+
+funnel <- tibble(stage = "1. Total emigrants", n = nrow(emigrants))
+
+# Step 2: has a non-NA BirthGp (needed to even enter the per-group loop)
+funnel <- add_row(funnel, stage = "2. Has BirthGp",
+                   n = sum(!is.na(emigrants$BirthGp)))
+
+# Step 3: BirthGp has a presence matrix at all
+has_presence_grp <- !is.na(emigrants$BirthGp) &
+  emigrants$BirthGp %in% names(group_presence_matrices)
+funnel <- add_row(funnel, stage = "3. BirthGp has presence matrix",
+                   n = sum(has_presence_grp))
+
+# Step 4: has Momcode, DOB, and juvenile_period_end all non-NA
+# (these three are required before the mom-lookup step even runs)
+has_core_fields <- has_presence_grp &
+  !is.na(emigrants$Momcode) & !is.na(emigrants$DOB) &
+  !is.na(emigrants$juvenile_period_end)
+funnel <- add_row(funnel, stage = "4. Has Momcode + DOB + period_end",
+                   n = sum(has_core_fields))
+
+# Step 5: mom actually appears in her son's BirthGp presence matrix
+# (i.e. was she ever recorded as physically present in that group?)
+mom_in_presence <- mapply(function(mom, grp, ok) {
+  if (!ok) return(FALSE)
+  pm <- group_presence_matrices[[grp]]
+  !is.na(mom) && mom %in% colnames(pm)
+}, emigrants$Momcode, emigrants$BirthGp, has_core_fields)
+funnel <- add_row(funnel, stage = "5. Mom present in son's BirthGp presence matrix",
+                   n = sum(mom_in_presence))
+
+# Step 6: mom actually appears in the elo.seq() pmat for that group
+# (i.e. she participated in >=1 qualifying AF-AF conflict there)
+# — build one elo object per BirthGp, mirroring calculate_mother_elo()
+mom_in_elo <- rep(FALSE, nrow(emigrants))
+for (grp in unique(emigrants$BirthGp[mom_in_presence])) {
+  idx <- which(emigrants$BirthGp == grp & mom_in_presence)
+  presence <- group_presence_matrices[[grp]]
+  presence_individuals <- setdiff(colnames(presence), "Date")
+  group_conflicts <- female_conflict_data %>%
+    filter(group == grp, winner %in% presence_individuals, loser %in% presence_individuals)
+  if (nrow(group_conflicts) == 0) next
+  elo_obj <- tryCatch(
+    EloRating::elo.seq(winner = group_conflicts$winner, loser = group_conflicts$loser,
+                        Date = group_conflicts$date, draw = NULL,
+                        presence = presence, runcheck = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(elo_obj)) next
+  mom_in_elo[idx] <- emigrants$Momcode[idx] %in% colnames(elo_obj$pmat)
+}
+funnel <- add_row(funnel, stage = "6. Mom appears in group's elo.seq pmat",
+                   n = sum(mom_in_elo))
+
+# Step 7: final actual count from your pipeline, for comparison
+funnel <- add_row(funnel, stage = "7. Actual mother_avg_elo non-NA (pipeline output)",
+                   n = sum(!is.na(emigrants$mother_avg_elo)))
+
+print(funnel)
+```
+
+
+```{r}
+
+```
+
