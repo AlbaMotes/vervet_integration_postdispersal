@@ -5,19 +5,6 @@ date: "2025-09-10"
 output: html_document
 ---
 
-# Terminal access (legacy, no longer needed)
-
-Previously, the bisonR package required a conda environment. This is no longer
-necessary — we bypass bisonR's broken `draw_edgelist_samples()` and sample
-directly from the Beta posterior with `rbeta()`.
-
-```
-# Legacy instructions (kept for reference):
-mamba activate bisonR
-cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Analyses/scripts_josieway_conflict_calc_bayes_nets_sem
-Rscript run_proximity_with_posteriors.R
-```
-
 # Setup
 
 ```{r setup, message=FALSE}
@@ -275,7 +262,7 @@ source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Ve
 144 males with posteriors saved.
 
 # Load results
-
+This file is generated when you run the previous script (bison_prox_net_script.R)
 ```{r load-results}
 network_proximity_bayes <- read.csv(
   "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/Pooja_chapter_matrank/Data/network_mets_prox_bayes.csv"
