@@ -1,0 +1,307 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Maternal Rank Pipeline Map</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,500;7..72,650&family=Public+Sans:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one reading column; run-order strip, file ledger table, then one record per script. Colors keyed to file roles (read / write / overwrite). */
+:root{
+  --bg:#f6f8f6; --surface:#ffffff; --fg:#1d2621; --muted:#5d6b63; --line:#d9e1dc;
+  --accent:#2f6f57; --read:#2d5f8a; --write:#2f6f57; --over:#a5551b; --warn:#a33a2c;
+  --read-bg:#e6eef6; --write-bg:#e3f0ea; --over-bg:#f7ebe0; --warn-bg:#f8e7e4; --chip:#eef2ef;
+  --display:"Literata",Georgia,serif; --body:"Public Sans",system-ui,sans-serif; --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#141a17; --surface:#1b2320; --fg:#e3ebe6; --muted:#9aa9a1; --line:#2e3a34;
+  --accent:#7cc4a4; --read:#8db8e0; --write:#7cc4a4; --over:#e7a56c; --warn:#ef8f80;
+  --read-bg:#1f2c38; --write-bg:#1d2f27; --over-bg:#352719; --warn-bg:#3a2220; --chip:#232d29; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#141a17; --surface:#1b2320; --fg:#e3ebe6; --muted:#9aa9a1; --line:#2e3a34;
+  --accent:#7cc4a4; --read:#8db8e0; --write:#7cc4a4; --over:#e7a56c; --warn:#ef8f80;
+  --read-bg:#1f2c38; --write-bg:#1d2f27; --over-bg:#352719; --warn-bg:#3a2220; --chip:#232d29; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:15px;line-height:1.55}
+.wrap{max-width:1040px;margin:0 auto;padding-block:32px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:grid;gap:40px}
+h1,h2,h3{font-family:var(--display);font-weight:650;text-wrap:balance;margin:0}
+h1{font-size:2rem;line-height:1.15}
+h2{font-size:1.35rem;margin-bottom:12px}
+h3{font-size:1.1rem}
+p{margin:0;max-width:68ch}
+.lede{color:var(--muted);margin-top:8px}
+code,.mono{font-family:var(--mono);font-size:.82em}
+.legend{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:16px;font-size:.85rem;color:var(--muted)}
+.tag{display:inline-block;font-family:var(--mono);font-size:.72rem;padding:1px 6px;border-radius:4px;background:var(--chip);color:var(--muted);white-space:nowrap}
+.k-read{background:var(--read-bg);color:var(--read)}
+.k-write{background:var(--write-bg);color:var(--write)}
+.k-over{background:var(--over-bg);color:var(--over)}
+.k-warn{background:var(--warn-bg);color:var(--warn)}
+.locs{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:.8rem;margin-top:12px;color:var(--muted)}
+.locs code{word-break:break-all}
+.filter{display:flex;gap:8px;align-items:center;position:sticky;top:env(safe-area-inset-top,0px);background:var(--bg);padding-block:10px;z-index:5;border-bottom:1px solid var(--line)}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:10;background:var(--bg)}
+.filter input{flex:1;min-width:0;font:inherit;padding:8px 12px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--fg)}
+.filter input:focus{outline:2px solid var(--accent);outline-offset:1px}
+.filter span{font-size:.8rem;color:var(--muted);white-space:nowrap}
+/* run order */
+.flow{display:grid;gap:10px}
+.stage{display:grid;grid-template-columns:110px 1fr;gap:12px;align-items:start}
+.stage .lab{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding-top:4px}
+.stage .items{display:flex;flex-wrap:wrap;gap:6px}
+.pill{font-family:var(--mono);font-size:.78rem;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--fg);text-decoration:none}
+.pill:hover,.pill:focus{border-color:var(--accent)}
+.flownote{font-size:.85rem;color:var(--muted)}
+/* table */
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:.85rem;min-width:720px}
+th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;background:var(--surface);position:sticky;top:0}
+tr:last-child td{border-bottom:0}
+td.fn{font-family:var(--mono);font-size:.8rem;word-break:break-word}
+td .who{display:flex;flex-wrap:wrap;gap:4px}
+/* scripts */
+.scripts{display:grid;gap:16px}
+.script{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px 20px;display:grid;gap:14px;scroll-margin-top:70px}
+.script header{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline}
+.num{font-family:var(--mono);font-weight:600;color:var(--accent)}
+.fname{font-family:var(--mono);font-size:.78rem;color:var(--muted);word-break:break-all}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px 24px}
+.blk{min-width:0}
+.blk h4{margin:0 0 6px;font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:600}
+.blk ul{margin:0;padding:0;list-style:none;display:grid;gap:5px}
+.blk li{font-size:.86rem;min-width:0;overflow-wrap:anywhere}
+.blk li .f{font-family:var(--mono);font-size:.8rem;font-weight:600}
+.blk li .d{color:var(--muted)}
+.fns{display:flex;flex-wrap:wrap;gap:4px}
+.fns code{background:var(--chip);padding:1px 6px;border-radius:4px}
+.wide{grid-column:1/-1}
+.issues li{padding-left:10px;border-left:3px solid var(--warn)}
+.renames li{padding-left:10px;border-left:3px solid var(--over)}
+.empty{color:var(--muted);font-style:italic;font-size:.85rem}
+[hidden]{display:none!important}
+</style>
+
+<div class="wrap">
+  <section>
+    <h1>Maternal rank pipeline map</h1>
+    <p class="lede">What each Rmd in the vervet maternal-male rank analysis pipeline reads, sources, defines and writes, and where a file or object changes name along the way. Scripts are listed in run order.</p>
+    <div class="legend">
+      <span><span class="tag k-read">read</span> file loaded from disk</span>
+      <span><span class="tag k-write">writes</span> new file</span>
+      <span><span class="tag k-over">overwrites</span> file another script also writes</span>
+    </div>
+    <div class="locs">
+      <code>Data/</code><code>…/Pooja_chapter_matrank/Data/</code>
+      <code>Analyses/</code><code>…/Pooja_chapter_matrank/Analyses/</code>
+      <code>IVP/</code><code>…/Vervet_projects/IVP_data/</code>
+    </div>
+  </section>
+
+  <div class="filter">
+    <input id="q" type="search" placeholder="Filter by file, function, column or object (e.g. emigrants_full_merged, obs_weight)" aria-label="Filter">
+    <span id="count"></span>
+  </div>
+
+  <section id="order">
+    <h2>Run order</h2>
+    <div class="flow" id="flow"></div>
+  </section>
+
+  <section id="files">
+    <h2>File ledger</h2>
+    <p class="lede" style="margin-bottom:12px">Every file on disk the scripts touch, with the scripts that produce and consume it.</p>
+    <div class="tbl"><table>
+      <thead><tr><th>File</th><th>Where</th><th>Written by</th><th>Read by</th></tr></thead>
+      <tbody id="ledger"></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Scripts</h2>
+    <div class="scripts" id="scripts"></div>
+  </section>
+</div>
+
+<script>
+const S = [
+{id:"1", file:"1. Immigrant_selection_database_v3.Rmd", title:"Immigrant selection, presence matrices, Elo ratings",
+ reads:[["life_history.csv","IVP/","life_hist"],["agonistic.csv","IVP/adlib/","newest_aggression_data"]],
+ sources:[["elo_rating_male_calculator.R","Analyses/","calculate_elo_ratings()"]],
+ pkgs:"EloRating, stringr, lubridate, dplyr, ggplot2, stringdist, tidyr, purrr",
+ defines:["build_presence_matrix","build_all_presence_matrices","analyze_male_emigration","long_to_code","decide_win_factory / decide_win","calculate_age","get_age_class","build_winner_loser","filter_conflicts_by_presence","add_age_classes","calculate_mother_elo","check_immigration_presence","check_male_conflicts_after_immigration"],
+ writes:[["All_potential_immigrants_Josie_version.csv","Data/","emigrants: 212 males with maternal Elo (AF-AF and _all), own Elo one year post-immigration and end of tenure, presence/conflict flags"],["group_presence_matrices.rds","Data/","daily 0/1 presence per group (CR removed)"]],
+ plots:[["View() of AK presence matrix","not saved"]],
+ env:["life_hist","group_presence_matrices","emigrants","newest_aggression_data","conflict_data","female_conflict_data","all_conflict_data","ag, mm, male_outcomes (diagnostics)"],
+ renames:["agonistic.csv columns: idindividual1 → Aggressor, idindividual2 → Victim, behaviourindiv1 → AggressorBehaviour, behaviourindiv2 → VictimBehaviour","life_hist$Mother spellings corrected (Nkosikazi → Nkosikasi plus Levenshtein ≤ 2 near-misses)","emigrants → emigrants_all (adds mother_avg_elo_all, juvenile_period_length_all) → assigned back to emigrants","CR removed from conflict_data, emigrants and group_presence_matrices","Columns added to emigrants: Momcode, mother_avg_elo, juvenile_period_length, ImmigBirthday1, IsPresentOnBirthday, HasConflictsAfterImmig, ConflictCountAfterImmig, elo_one_year_all, elo_one_year_male_male (+ rating dates), end-of-tenure Elos, immigration_birthday, days_diff_one_year_*"]},
+
+{id:"2", file:"2. Proximity_data_rank_analyses_bayes.Rmd", title:"Scan preprocessing and post-dispersal proximity networks",
+ reads:[["All_potential_immigrants_Josie_version.csv","Data/","emigrants (used by the sourced script)"],["scan.csv","IVP/scans/","scans_raw"],["network_mets_prox_bayes.csv","Data/","network_proximity_bayes (read back after sourcing)"]],
+ sources:[["scan_extraction_1mandarm.R","Analyses/","extract_proximity_pairs()"],["bison_prox_net_script.R","Analyses/bayes_nets_sem/","extract_male_network_metrics(), compute_metrics_from_posterior(); writes the proximity metrics and posteriors"]],
+ pkgs:"dplyr, tidyr, igraph, tibble, purrr, lubridate",
+ defines:["filter_independent_scans","add_scan_numbers","extract_1m_only","extract_arm_only","build_network_metrics"],
+ writes:[["scans_ivp_20minfiltered.csv","IVP/scans/","scans ≥ 20 min apart per individual per day"],["scanswithid_ivp_20minfiltered.csv","IVP/scans/","same, with scan_number and scan_id"],["scans_for_bison.csv","IVP/scans/","same, with group_Abbreviation"],["network_mets_prox_bayes.csv","Data/","per-male proximity strength/degree/eigenvector summaries (via sourced script)"],["prox_posteriors.rds","Data/","1000 draws per male: prox_strength, prox_degree (via sourced script)"]],
+ plots:[["Scatter: 1 m vs arm-length strength, 2016–2021","not saved"]],
+ env:["scans","distance_year_table","distance_pivot","network_proximity_bayes","comparison_full"],
+ renames:["scans_raw → scans_ivp_filtered → scans","IDs in idindividual1, ind1m, indarmlength, ind2m, ind5m, ind10m lowercased and trimmed","Prose says the output is network_mets_proximity_bayes.csv; the file actually read back is network_mets_prox_bayes.csv"]},
+
+{id:"3.1", file:"3.1.Processing_grooming_adlib.Rmd", title:"Build directed grooming dataset",
+ reads:[["affiliative.csv","IVP/adlib/","affiliative"],["All_potential_immigrants_Josie_version.csv","Data/","emigrants (loaded, not used)"]],
+ sources:[],
+ pkgs:"dplyr, tidyr, igraph, purrr",
+ defines:["reshape_affiliative_data","contains_valid","get_unique_codes","modify_grooming_data","get_combination_counts"],
+ writes:[["grooming_data2010_2025.csv","Data/","gr/bgr interactions, idindividual1 always the groomer, with group_Abbreviation"]],
+ plots:[],
+ env:["affiliative (reshaped)","grooming_data","combination_counts"],
+ renames:["affiliative: individuals 3/4 and 5/6 stacked as extra rows (interaction2/3 → interaction)","affiliative filtered to gr/bgr rows → grooming_data","Rows flipped or duplicated so individual1 is always the groomer"]},
+
+{id:"3.2", file:"3.2 Affiliative_data_rank_analyses_Bayes.Rmd", title:"Post-dispersal grooming networks",
+ reads:[["All_potential_immigrants_Josie_version.csv","Data/","emigrants"],["grooming_data2010_2025.csv","Data/","grooming_data"],["affiliative.csv","IVP/adlib/","affiliative (raw; observation-day counts)"],["group_presence_matrices.rds","Data/","group_presence_matrices"]],
+ sources:[["bison_groom_net_script.R","Analyses/bayes_nets_sem/","extract_male_grooming_metrics(), compute_directed_metrics_from_posterior(); writes grooming metrics and posteriors"]],
+ pkgs:"dplyr, tidyr, igraph, purrr",
+ defines:[],
+ writes:[["network_mets_groom_bayes.csv","Data/","in/out strength and degree, eigenvector, grooming_rate, days_observed, median_group_size, n_dyads (via sourced script)"],["groom_posteriors.rds","Data/","1000 draws per male: groom_in/out_strength, groom_in/out_degree (132 males)"]],
+ plots:[], env:[], renames:[]},
+
+{id:"4", file:"4.Merge_net_mets_with_ranks.Rmd", title:"Merge network metrics with ranks",
+ reads:[["network_mets_prox_bayes.csv","Data/","proximity_metrics"],["All_potential_immigrants_Josie_version.csv","Data/","emigrants"],["network_mets_groom_bayes.csv","Data/","grooming_metrics"]],
+ sources:[], pkgs:"none loaded (relies on dplyr already in session)",
+ defines:[],
+ writes:[["emigrants_full_merged.csv","Data/","base merged table, one row per male"]],
+ plots:[], env:["emigrants_full"],
+ renames:["emigrants → emigrants_full","group, start_date, end_date dropped from both metric files","Overlapping grooming columns get suffix _groom (eigenvector_mean/lower/upper → *_groom, n_dyads → n_dyads_groom)"]},
+
+{id:"5", file:"5.Maternal_rank_bayesian_sem.Rmd", title:"Maternal rank → post-dispersal network → male rank",
+ reads:[["emigrants_full_merged.csv","Data/","emigrants_full"],["prox_posteriors.rds","Data/","prox_posteriors"],["groom_posteriors.rds","Data/","groom_posteriors"]],
+ sources:[], pkgs:"dplyr, tibble, ggplot2, brms, posterior",
+ defines:["summarize_network_draws","check_joint_convergence","run_bison_mediation_bayesian_joint"],
+ writes:[["rank_mediation_results_bayesian_joint_PARTIAL.rds","Data/","summaries saved after each mediator"],["sem_pooled_posteriors_bayesian_joint_PARTIAL.rds","Data/","pooled a, b, c', indirect draws so far"],["rank_mediation_results_bayesian_joint.csv","Data/","final path summaries, 6 mediators"],["sem_pooled_posteriors_bayesian_joint.rds","Data/","final pooled draws"]],
+ plots:[], env:["sem_data (n = 33)","full_summary_bayes","all_pooled_bayes"],
+ renames:["Adds in memory only: start_date_effective, window_end, effective_end, days_present_first_year, obs_weight (not saved here)"]},
+
+{id:"6", file:"6.Maternal_investment_bayesian_sem.Rmd", title:"Maternal investment → post-dispersal network → male rank",
+ reads:[["emigrants_full_merged.csv","Data/","emigrants_full"],["grooming_data2010_2025.csv","Data/","grooming_data"],["scans_for_bison.csv","IVP/scans/","scans"],["prox_posteriors.rds","Data/","prox_posteriors (read again in the patch chunk)"],["groom_posteriors.rds","Data/","groom_posteriors"],["investment_mediation_bayesian.csv","Data/","existing_summary6 (patch chunk)"],["investment_pooled_posteriors_bayesian.rds","Data/","existing_pooled6 (patch chunk)"]],
+ sources:[["scan_extraction_1mandarm.R","Analyses/","extract_proximity_pairs() (sourced, not used)"]],
+ pkgs:"dplyr, tibble, ggplot2, brms, posterior",
+ defines:["summarize_network_draws","check_joint_convergence","run_investment_mediation_bayesian_joint"],
+ writes:[["emigrants_full_merged.csv","Data/","adds obs_weight columns and mom_groom_days_to_son, mom_total_groom_days, mom_groom_proportion, mom_prox_with_son, mom_son_total_scans, mom_prox_proportion","over"],["investment_mediation_bayesian_groom_PARTIAL.rds","Data/",""],["investment_pooled_posteriors_bayesian_groom_PARTIAL.rds","Data/",""],["investment_mediation_bayesian_prox_PARTIAL.rds","Data/",""],["investment_pooled_posteriors_bayesian_prox_PARTIAL.rds","Data/",""],["investment_mediation_bayesian.csv","Data/","final summaries; rewritten by the prox_degree patch","over"],["investment_pooled_posteriors_bayesian.rds","Data/","final pooled draws; rewritten by the patch","over"],["investment_mediation_bayesian_backup_<timestamp>.csv","Data/","copy made before the patch"]],
+ plots:[], env:["sem_data_groom","sem_data_prox","both (diagnostic)","full_summary_bayes","updated_summary6"],
+ renames:["Code and Momcode lowercased; dates converted (saved that way)","Investment window: DOB → juvenile_period_end (includes the infant year)"]},
+
+{id:"7", file:"7.Mother_network_position_bayesian_sem.Rmd", title:"Mother's eigen-centrality → post-dispersal network → male rank",
+ reads:[["emigrants_full_merged.csv","Data/","emigrants_full"],["grooming_data2010_2025.csv","Data/","grooming_data"],["scans_for_bison.csv","IVP/scans/","scans"],["prox_posteriors.rds","Data/","prox_posteriors"],["groom_posteriors.rds","Data/","groom_posteriors"],["sem_mother_eigen_network_results_bayesian.csv","Data/","existing_summary7 (patch chunk)"],["sem_mother_eigen_network_pooled_posteriors_bayesian.rds","Data/","existing_pooled7 (patch chunk)"]],
+ sources:[["scan_extraction_1mandarm.R","Analyses/","extract_proximity_pairs()"]],
+ pkgs:"dplyr, tibble, igraph, ggplot2, tidyr, brms, posterior",
+ defines:["compute_eigen_from_posterior","get_mother_windows","extract_mother_grooming_eigen","extract_mother_proximity_eigen","build_predictor_sem_data","summarize_network_draws","check_joint_convergence","run_mother_eigen_mediation_bayesian_joint"],
+ writes:[["emigrants_full_merged.csv","Data/","adds mom_groom_eigen_mean, n_dyads_mom_groom, mom_prox_eigen_mean, n_dyads_mom_prox","over"],["mother_groom_eigen_posteriors.rds","Data/","draws keyed Momcode_BirthGp_DOB"],["mother_prox_eigen_posteriors.rds","Data/","draws keyed Momcode_BirthGp_DOB"],["sem_mother_eigen_network_bayesian_groom_PARTIAL.rds","Data/",""],["sem_mother_eigen_network_pooled_posteriors_bayesian_groom_PARTIAL.rds","Data/",""],["sem_mother_eigen_network_bayesian_prox_PARTIAL.rds","Data/",""],["sem_mother_eigen_network_pooled_posteriors_bayesian_prox_PARTIAL.rds","Data/",""],["sem_mother_eigen_network_results_bayesian.csv","Data/","final summaries; rewritten by patch","over"],["sem_mother_eigen_network_pooled_posteriors_bayesian.rds","Data/","final pooled draws; rewritten by patch","over"],["sem_mother_eigen_network_results_bayesian_backup_<timestamp>.csv","Data/","copy made before the patch"]],
+ plots:[], env:["mother_windows (80)","mother_groom_eigen / mother_prox_eigen","sem_data_mom_groom_eigen, sem_data_mom_prox_eigen (n = 38)","full_summary_eigen","updated_summary7"],
+ renames:["mother_groom_eigen$posteriors → mother_groom_eigen_posteriors; same for prox","Sons matched to mothers through mom_key (prefix Momcode_)"]},
+
+{id:"8", file:"8.Juvenile_grooming_network.Rmd", title:"Juvenile (natal) grooming networks",
+ reads:[["All_potential_immigrants_Josie_version.csv","Data/","emigrants"],["grooming_data2010_2025.csv","Data/","grooming_data"],["affiliative.csv","IVP/adlib/","affiliative"],["group_presence_matrices.rds","Data/","group_presence_matrices"]],
+ sources:[], pkgs:"dplyr, tidyr, igraph, purrr",
+ defines:["build_juvenile_window","compute_directed_metrics_from_posterior","extract_male_grooming_metrics_juvenile","extract_male_grooming_metrics_juvenile_no_mom","compute_simple_strength"],
+ writes:[["network_mets_groom_bayes_juvenile.csv","Data/","juvenile grooming summaries per male"],["groom_posteriors_juvenile.rds","Data/","draws: groom_*_juv (77 males)"]],
+ plots:[], env:["emigrants_juv","groom_results_juv","groom_results_juv_nomom (not saved)","comparison, comparison_simple"],
+ renames:["emigrants → emigrants_juv (adds natal_group = BirthGp, dispersal_date, juvenile_window_start = DOB+365, juvenile_window_end)","Posterior fields renamed with _juv; mother-excluded run uses _juv_nomom","Degree divided by (n_nodes − 1), unlike the adult networks"]},
+
+{id:"9", file:"9.Juvenile_proximity_network.Rmd", title:"Juvenile (natal) proximity networks",
+ reads:[["All_potential_immigrants_Josie_version.csv","Data/","emigrants"],["scans_for_bison.csv","IVP/scans/","scans"]],
+ sources:[["scan_extraction_1mandarm.R","Analyses/ (via Data/../Analyses)","extract_proximity_pairs()"]],
+ pkgs:"dplyr, tidyr, igraph, tibble, purrr",
+ defines:["build_juvenile_window","compute_metrics_from_posterior","extract_male_network_metrics_juvenile"],
+ writes:[["network_mets_prox_bayes_juvenile.csv","Data/","juvenile proximity summaries"],["prox_posteriors_juvenile.rds","Data/","draws: prox_strength_juv, prox_degree_juv (81 males)"]],
+ plots:[], env:["emigrants_juv","prox_results_juv"],
+ renames:["emigrants → emigrants_juv (same window as script 8)"]},
+
+{id:"10", file:"10.Juvenile_social_behaviour_matrank.Rmd", title:"Maternal predictors → juvenile network → male rank",
+ reads:[["emigrants_full_merged.csv","Data/","emigrants_full"],["prox_posteriors_juvenile.rds","Data/","prox_posteriors_juv"],["groom_posteriors_juvenile.rds","Data/","groom_posteriors_juv"],["network_mets_prox_bayes_juvenile.csv","Data/","prox_juv_summary"],["network_mets_groom_bayes_juvenile.csv","Data/","groom_juv_summary"],["mother_groom_eigen_posteriors.rds","Data/","mother_groom_eigen_posteriors"],["mother_prox_eigen_posteriors.rds","Data/","mother_prox_eigen_posteriors"],["group_presence_matrices.rds","Data/","group_presence_matrices"],["grooming_data2010_2025.csv","Data/","grooming_data"],["scans_for_bison.csv","IVP/scans/","scans"],["juvenile_mediation_all_predictors_bayesian.csv","Data/","full_summary_juv (read back for the plot)"]],
+ sources:[], pkgs:"dplyr, tibble, purrr, brms, posterior, ggplot2",
+ defines:["compute_juvenile_days_present","summarize_network_draws","check_joint_convergence","run_juvenile_mediation_bayesian_joint","build_predictor_sem_data_juv","run_juvenile_mediation_bayesian_joint_eigen"],
+ writes:[["juvenile_mediation_results_bayesian_ALL_PARTIAL.rds","Data/",""],["juvenile_mediation_pooled_posteriors_ALL_PARTIAL.rds","Data/",""],["juvenile_mediation_all_predictors_bayesian_backup_<timestamp>.csv","Data/","copy of previous results"],["juvenile_mediation_all_predictors_bayesian.csv","Data/","5 predictors × 6 juvenile mediators, paths a, b, c', indirect, total"],["juvenile_mediation_pooled_posteriors_all_predictors.rds","Data/","pooled draws"]],
+ plots:[["Forest plot of path a by predictor and mediator","not saved"]],
+ env:["emigrants_full (with juvenile columns, not saved)","full_summary_juv","all_pooled_juv","plot_data_juv"],
+ renames:["mom_groom_proportion and mom_prox_proportion overwritten in memory with juvenile-window versions (DOB+365 → dispersal); CSV keeps script 6's version","Juvenile summaries joined with new names: strength_mean → prox_strength_juv_mean, degree_mean → prox_degree_juv_mean, out_strength_mean → groom_out_strength_juv_mean, etc.","juvenile_obs_weight (raw days present) standardized and used as obs_weight inside the model"]},
+
+{id:"11", file:"11. Juvenile_postdispersal_correlations.Rmd", title:"Juvenile vs post-dispersal correlations; maternal-trait correlations",
+ reads:[["emigrants_full_merged.csv","Data/","emigrants_full"],["prox_posteriors.rds","Data/","prox_posteriors"],["groom_posteriors.rds","Data/","groom_posteriors"],["prox_posteriors_juvenile.rds","Data/","prox_posteriors_juv"],["groom_posteriors_juvenile.rds","Data/","groom_posteriors_juv"]],
+ sources:[], pkgs:"dplyr, purrr, tibble, ggplot2, ggcorrplot, Hmisc, RColorBrewer",
+ defines:["summarize_network_draws","correlate_juvenile_post_dispersal"],
+ writes:[["juvenile_vs_postdispersal_correlations.csv","Data/","posterior r summaries per metric"],["juvenile_vs_postdispersal_correlation_draws.rds","Data/","r draws per metric"],["juvenile_vs_postdispersal_correlation_densities.png","Data/","density plot of r"],["maternal_vs_male_rank.png","Data/","maternal rank vs male rank scatter"]],
+ plots:[["Density of r per metric pair","juvenile_vs_postdispersal_correlation_densities.png"],["Histograms of adult prox_degree for 6 males","not saved"],["ggcorrplot of maternal traits","not saved"],["Maternal rank vs male rank, colored by natal group","maternal_vs_male_rank.png"]],
+ env:["corr_out","cor_matrix","cor_results","p"],
+ renames:["Maternal columns relabeled for the correlation matrix (mother_avg_elo → “Maternal rank”, etc.)"]},
+
+{id:"12", file:"12.Group_effects_bayesian.Rmd", title:"Natal-group ICC and immigration-group context",
+ reads:[["emigrants_full_merged.csv","Data/","emigrants_full"],["groom_posteriors_juvenile.rds","Data/","groom_posteriors_juv"],["prox_posteriors_juvenile.rds","Data/","prox_posteriors_juv"],["group_presence_matrices.rds","Data/","group_presence_matrices"],["life_history.csv","IVP/","life_hist"],["prox_posteriors.rds","Data/","prox_posteriors"],["groom_posteriors.rds","Data/","groom_posteriors"]],
+ sources:[], pkgs:"dplyr, tibble, brms",
+ defines:["run_posterior_outcome_model","fit_natal_group_icc_fixed","get_group_context","fit_dispersal_context_fixed"],
+ writes:[["natal_group_icc_results_maternal.csv","Data/","ICC for 4 maternal traits"],["natal_group_icc_results.csv","Data/","ICC for maternal rank + 6 juvenile network metrics"],["dispersal_context_network_results.csv","Data/","group size / sex ratio effects on 6 adult network metrics"]],
+ plots:[], env:["mediation_sample_codes (33)","emigrants_full_icc","fit_rank_context","prox_juv_means"],
+ renames:["life_hist$Code lowercased","Adds group_size_at_immigration and sex_ratio_at_immigration to emigrants_full (in memory only)"]}
+];
+
+const esc = s => String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const slug = id => "s-"+id.replace(/\./g,"-");
+
+// ledger
+const files = {};
+const key = (f,l) => f;
+S.forEach(s=>{
+  (s.reads||[]).forEach(([f,l])=>{ (files[f] ||= {loc:l,w:[],r:[]}).r.push(s.id); });
+  (s.writes||[]).forEach(([f,l,_d,m])=>{ (files[f] ||= {loc:l,w:[],r:[]}).w.push(s.id+(m==="over"?"*":"")); });
+  (s.sources||[]).forEach(([f,l])=>{ (files[f] ||= {loc:l,w:[],r:[]}).r.push(s.id+" (source)"); });
+});
+// add files produced inside sourced scripts' calling script already counted; mark overwrite where >1 writer
+const rowsHTML = Object.entries(files).sort((a,b)=>a[1].loc.localeCompare(b[1].loc)||a[0].localeCompare(b[0])).map(([f,o])=>{
+  const multi = new Set(o.w.map(x=>x.replace("*",""))).size>1 || o.w.some(x=>x.endsWith("*"));
+  const w = o.w.length ? o.w.map(x=>`<a class="tag ${multi?'k-over':'k-write'}" href="#${slug(x.replace('*',''))}">${esc(x.replace('*',''))}</a>`).join("") : '<span class="tag">raw input</span>';
+  const r = [...new Set(o.r)].map(x=>`<a class="tag k-read" href="#${slug(x.split(' ')[0])}">${esc(x)}</a>`).join("") || '<span class="empty">none</span>';
+  return `<tr data-s="${esc((f+' '+o.loc+' '+o.w.join(' ')+' '+o.r.join(' ')).toLowerCase())}"><td class="fn">${esc(f)}</td><td class="fn">${esc(o.loc)}</td><td><div class="who">${w}</div></td><td><div class="who">${r}</div></td></tr>`;
+}).join("");
+document.getElementById("ledger").innerHTML = rowsHTML;
+
+// flow
+const stages = [
+  ["Base data",["1"],"Elo ratings, emigrants table, presence matrices"],
+  ["Raw → networks",["2","3.1","3.2"],"3.1 must run before 3.2"],
+  ["Merge",["4"],"Creates emigrants_full_merged.csv"],
+  ["Post-dispersal SEMs",["5","6","7"],"Run 6 before 7: both overwrite the merged CSV and 7 keeps 6's columns"],
+  ["Juvenile networks",["8","9"],""],
+  ["Juvenile SEMs & checks",["10","11","12"],""]
+];
+document.getElementById("flow").innerHTML = stages.map(([lab,ids,note])=>`<div class="stage"><div class="lab">${lab}</div><div><div class="items">${ids.map(i=>`<a class="pill" href="#${slug(i)}">${i}</a>`).join("")}</div>${note?`<p class="flownote">${esc(note)}</p>`:""}</div></div>`).join("");
+
+// scripts
+const list = (arr, fn, empty="None") => arr && arr.length ? `<ul>${arr.map(fn).join("")}</ul>` : `<p class="empty">${empty}</p>`;
+document.getElementById("scripts").innerHTML = S.map(s=>{
+  const text = JSON.stringify(s).toLowerCase();
+  const reads = list(s.reads,([f,l,a])=>`<li><span class="tag k-read">read</span> <span class="f">${esc(f)}</span> <span class="tag">${esc(l)}</span><br><span class="d">as ${esc(a)}</span></li>`);
+  const sess = s.session ? `<div class="blk"><h4>Needs from R session</h4>${list(s.session,x=>`<li><code>${esc(x)}</code></li>`)}</div>` : "";
+  const src = list(s.sources,([f,l,g])=>`<li><span class="f">${esc(f)}</span> <span class="tag">${esc(l)}</span><br><span class="d">${esc(g)}</span></li>`);
+  const writes = list(s.writes,([f,l,d,m])=>`<li><span class="tag ${m==="over"?"k-over":"k-write"}">${m==="over"?"overwrites":"writes"}</span> <span class="f">${esc(f)}</span> <span class="tag">${esc(l)}</span>${d?`<br><span class="d">${esc(d)}</span>`:""}</li>`,"No files written");
+  const plots = list(s.plots,([d,sv])=>`<li>${esc(d)} <span class="tag ${sv==="not saved"?"":"k-write"}">${esc(sv)}</span></li>`,"No plots");
+  const env = list(s.env,x=>`<li><code>${esc(x)}</code></li>`,"—");
+  const fns = s.defines.length ? `<div class="fns">${s.defines.map(d=>`<code>${esc(d)}</code>`).join("")}</div>` : `<p class="empty">None defined in the Rmd</p>`;
+  const ren = s.renames.length ? `<div class="blk wide renames"><h4>Renames, overwrites &amp; new columns</h4>${list(s.renames,x=>`<li>${esc(x)}</li>`)}</div>` : "";
+  return `<article class="script" id="${slug(s.id)}" data-s="${esc(text)}">
+    <header><span class="num">${esc(s.id.replace(/[ab]$/,""))}</span><h3>${esc(s.title)}</h3><span class="fname">${esc(s.file)}</span></header>
+    <div class="grid">
+      <div class="blk"><h4>Reads</h4>${reads}</div>${sess}
+      <div class="blk"><h4>Sources</h4>${src}</div>
+      <div class="blk"><h4>Writes</h4>${writes}</div>
+      <div class="blk"><h4>Plots</h4>${plots}</div>
+      <div class="blk"><h4>Functions defined</h4>${fns}<p class="d" style="margin-top:8px;font-size:.8rem;color:var(--muted)">Packages: ${esc(s.pkgs)}</p></div>
+      <div class="blk"><h4>Key objects left in environment</h4>${env}</div>
+      ${ren}
+    </div></article>`;
+}).join("");
+
+// filter
+const q = document.getElementById("q"), count = document.getElementById("count");
+function apply(){
+  const v = q.value.trim().toLowerCase();
+  let n=0;
+  document.querySelectorAll("[data-s]").forEach(el=>{ const hit=!v||el.dataset.s.includes(v); el.hidden=!hit; if(hit&&el.tagName==="ARTICLE") n++; });
+  count.textContent = v ? `${n} script${n===1?"":"s"}` : `${S.length} scripts`;
+}
+q.addEventListener("input",apply); apply();
+</script>
+
+</body></html>
